@@ -1,0 +1,15 @@
+LoanType:
+  - "Prêt proxi"
+  - "Wininlening"
+  - "Prêt coup de pouce"
+  - "Assuré"
+  - "Garantie hypothécaire de premier rang"
+  - "Non assuré"
+  - "Fiducie-sûreté"
+  - "PMV"
+
+LoanRefundPeriodicity:
+  - "Mensuelle"
+  - "Trimestrielle"
+  - "Semestrielle"
+  - "Annuelle"

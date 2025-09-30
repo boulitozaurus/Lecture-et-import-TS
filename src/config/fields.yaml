@@ -1,0 +1,32 @@
+# Clés normalisées -> liste de regex pour faire le mapping depuis les libellés du PDF
+Loan Amount Borrow:
+  - "(?i)montant.*(pr[eê]t|obligataire|du financement)"
+  - "(?i)montant total.*(pr[eê]t|obligataire)"
+Loan Interest Rate:
+  - "(?i)taux.*(int[eé]r[eê]t|annuel)"
+  - "(?i)taux nominal"
+Loan Duration:
+  - "(?i)dur[eé]e.*(mois|mensuelle)"
+  - "(?i)dur[eé]e du pr[eê]t"
+Loan Refund Periodicity:
+  - "(?i)p[eé]riodicit[eé].*(remboursement|int[eé]r[eê]t)"
+  - "(?i)mensualit[eé]s?|trimestriel|semestriel|annuel"
+Loan Warranties:
+  - "(?i)s[uû]ret[eé]s?"
+  - "(?i)garantie.*"
+Commission Rate:
+  - "(?i)frais.*structuration"
+Exit Fee Commission Rate:
+  - "(?i)frais.*sortie"
+Periodicity Running Commission Rate:
+  - "(?i)frais.*gestion.*mensuel"
+  - "(?i)commission.*gestion.*mensuel"
+LTV Max Ratio:
+  - "(?i)LTV.*(apr[eè]s.*(travaux|division)|post.*travaux)"
+LTV Max Pre construction Ratio:
+  - "(?i)LTV.*(en l[’']?[eé]tat|pre.?construction)"
+Fund Usage Description:
+  - "(?i)(objet|utilisation) du (pr[eê]t|financement|pr[eê]t obligataire)"
+  - "(?i)usage des fonds"
+Loan Anticipated Refund:
+  - "(?i)remboursement anticip[eé].*"
