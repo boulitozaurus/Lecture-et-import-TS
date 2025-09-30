@@ -20,8 +20,29 @@ import streamlit as st
 import pandas as pd
 import pdfplumber
 
+# 1er essai: import package "src.rules"
+try:
+    from src.rules import apply_rules
+except Exception:
+    # 2e essai: charger directement le fichier src/rules.py s'il existe
+    rules_path = None
+    for base in [HERE.parent, HERE.parent.parent, HERE.parent.parent.parent, Path.cwd()] + list(HERE.parents):
+        cand = base / "src" / "rules.py"
+        if cand.exists():
+            rules_path = cand
+            break
+    if rules_path is not None:
+        spec = importlib.util.spec_from_file_location("rules", rules_path)
+        rules_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(rules_mod)  # type: ignore
+        apply_rules = rules_mod.apply_rules  # type: ignore
+    else:
+        # Fallback neutre: l'app tourne, mais sans appliquer les règles métier
+        def apply_rules(d, full_text): 
+            return dict(d)
+        st.warning("⚠️ Règles métier introuvables (src/rules.py). Fallback neutre activé.")
+
 from src.parser.pdf_parser import parse_pdf
-from src.rules import apply_rules
 from src.normalize import compute_derived_fields
 
 OUTPUTS = ROOT / "outputs"
