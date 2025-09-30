@@ -1,4 +1,3 @@
-# src/rules.py
 import re
 from typing import Dict, Any, List
 from pathlib import Path
@@ -6,12 +5,11 @@ from pathlib import Path
 try:
     import yaml
 except Exception:
-    yaml = None  # le code fonctionne aussi sans yaml (fallback interne)
+    yaml = None
 
 BASE = Path(__file__).resolve().parents[1]
 CLAUSES_CFG = BASE / "src" / "clauses" / "clauses_patterns.yaml"
 
-# Fallback interne si le YAML n'est pas présent
 DEFAULT_CLAUSE_PATTERNS: Dict[str, List[str]] = {
     "CAC_NOMINATION": [r"\bcommissaire[s]?\s+aux\s+comptes?\b", r"\bnomination\s+du\s+cac\b"],
     "CAC_REPORT": [r"\brapport\s+du\s+commissaire\s+aux\s+comptes?\b"],
@@ -28,7 +26,6 @@ def _load_clause_patterns() -> Dict[str, List[str]]:
         return DEFAULT_CLAUSE_PATTERNS
     try:
         data = yaml.safe_load(CLAUSES_CFG.read_text(encoding="utf-8")) or {}
-        # validation simple
         ok: Dict[str, List[str]] = {}
         for k, v in data.items():
             if isinstance(v, list):
@@ -55,10 +52,9 @@ def infer_periodicity(text: str) -> str | None:
     return None
 
 def infer_loan_type(text: str, warranties: str | None, rate: float | None) -> str | None:
-    # Règle DOCX: si taux ≠ {7, 7.5, 8} => class A+ => "Assuré"
+    # Règle DOCX : si taux ≠ {7, 7.5, 8} -> "Assuré"
     if rate is not None and (rate not in {7.0, 7.5, 8.0}):
         return "Assuré"
-    # Sinon, déduire via les sûretés/texte
     w = ((warranties or "") + "\n" + text).lower()
     if "fiducie" in w:
         return "Fiducie-sûreté"
@@ -89,7 +85,7 @@ def detect_centralizer(text: str) -> str:
         return "IbanFirst"
     if "aircap" in t:
         return "Aircap"
-    return "Aircap"  # fallback demandé
+    return "Aircap"  # fallback
 
 def detect_clauses(text: str) -> List[str]:
     found = []
@@ -120,7 +116,6 @@ def detect_covenants(text: str) -> List[str]:
     return cov
 
 def apply_rules(data: Dict[str, Any], full_text: str) -> Dict[str, Any]:
-    """Applique les règles métier (DOCX) sur les données extraites."""
     out = dict(data)
 
     # Périodicité
@@ -144,12 +139,12 @@ def apply_rules(data: Dict[str, Any], full_text: str) -> Dict[str, Any]:
     if clauses:
         out["Suspensives clauses"] = "; ".join(clauses)
 
-    # Covenants (facultatif, en champ texte)
+    # Covenants (si tu veux les stocker en champ texte)
     covs = detect_covenants(full_text)
     if covs:
         out["Covenants"] = "; ".join(covs)
 
-    # Loan Type (taux déjà normalisé ou pas)
+    # Loan Type (exploite le taux si déjà présent)
     rate = None
     try:
         rate = float(str(out.get("Loan Interest Rate","")).replace(",", "."))
@@ -157,5 +152,5 @@ def apply_rules(data: Dict[str, Any], full_text: str) -> Dict[str, Any]:
         pass
     out["Loan Type"] = infer_loan_type(full_text, out.get("Loan Warranties"), rate)
 
-    # IMPORTANT : pas de défaut pour Commission Rate / Periodicity Running Commission Rate
+    # IMPORTANT : pas de valeur par défaut pour Commission Rate / Periodicity Running Commission Rate
     return out
