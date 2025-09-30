@@ -54,6 +54,7 @@ def _fallback_pairs_from_text(text: str) -> List[Tuple[str, str]]:
     return pairs
 
 def parse_pdf(path: str) -> Dict[str, str]:
+    """Retourne un dict 'clé normalisée' -> 'valeur brute' (extraction seule)."""
     out: Dict[str, str] = {}
     with pdfplumber.open(path) as pdf:
         full_text = "\n".join([p.extract_text() or "" for p in pdf.pages])
@@ -67,7 +68,5 @@ def parse_pdf(path: str) -> Dict[str, str]:
             if key not in out or not out[key]:
                 out[key] = right
 
-    if re.search(r"remboursement anticip[eé].*sans frais", full_text, flags=re.I):
-        out["Loan Anticipated Refund"] = "Oui"
-        out["Exit Fee Commission Rate"] = "0%"
+    # NE PAS appliquer de règle ici (toutes les règles dans src/rules.py)
     return out
