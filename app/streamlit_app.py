@@ -1,49 +1,49 @@
-# --- MUST BE FIRST: make 'src' importable no matter the launch dir ---
+# --- MUST BE FIRST: robust project root detection & import path ---
 import sys, importlib.util
 from pathlib import Path
 
 HERE = Path(__file__).resolve()
 
-def _ensure_src_on_path() -> Path | None:
-    # essaie parent, grand-parent, cwd, puis remonte l'arbo jusqu'à trouver 'src'
-    candidates = [HERE.parent, HERE.parent.parent, HERE.parent.parent.parent, Path.cwd()]
-    for base in candidates + list(HERE.parents):
-        if (base / "src").exists():
-            if str(base) not in sys.path:
-                sys.path.insert(0, str(base))
+def find_project_root(start: Path) -> Path:
+    # Cherche un dossier qui contient à la fois 'src' et 'app'
+    for base in [start, *start.parents, Path.cwd()]:
+        if (base / "src").exists() and (base / "app").exists():
             return base
-    return None
+    # fallback: le parent de /app
+    return start.parent
 
-PROJECT_ROOT = _ensure_src_on_path()
+PROJECT_ROOT = find_project_root(HERE)
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+# alias attendu par le reste du code
+ROOT = PROJECT_ROOT
 
 import streamlit as st
 import pandas as pd
 import pdfplumber
 
-# 1er essai: import package "src.rules"
+# --- Import des règles métier avec fallback si src/rules.py est introuvable ---
 try:
-    from src.rules import apply_rules
+    from src.rules import apply_rules  # chemin normal
 except Exception:
-    # 2e essai: charger directement le fichier src/rules.py s'il existe
-    rules_path = None
-    for base in [HERE.parent, HERE.parent.parent, HERE.parent.parent.parent, Path.cwd()] + list(HERE.parents):
-        cand = base / "src" / "rules.py"
-        if cand.exists():
-            rules_path = cand
-            break
-    if rules_path is not None:
+    rules_path = PROJECT_ROOT / "src" / "rules.py"
+    if rules_path.exists():
         spec = importlib.util.spec_from_file_location("rules", rules_path)
         rules_mod = importlib.util.module_from_spec(spec)
+        assert spec and spec.loader
         spec.loader.exec_module(rules_mod)  # type: ignore
         apply_rules = rules_mod.apply_rules  # type: ignore
     else:
-        # Fallback neutre: l'app tourne, mais sans appliquer les règles métier
-        def apply_rules(d, full_text): 
+        # Fallback neutre: l'app tourne sans les règles (évite le crash)
+        def apply_rules(d, full_text):
             return dict(d)
         st.warning("⚠️ Règles métier introuvables (src/rules.py). Fallback neutre activé.")
 
+# Ces imports dépendent du sys.path fixé ci-dessus
 from src.parser.pdf_parser import parse_pdf
 from src.normalize import compute_derived_fields
+
 
 OUTPUTS = ROOT / "outputs"
 OUTPUTS.mkdir(exist_ok=True, parents=True)
