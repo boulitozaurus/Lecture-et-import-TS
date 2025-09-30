@@ -1,4 +1,3 @@
-# code_de_clause: liste de regex (insensibles à la casse)
 CAC_NOMINATION:
   - "\\bcommissaire[s]?\\s+aux\\s+comptes?\\b"
   - "\\bnomination\\s+du\\s+cac\\b"
