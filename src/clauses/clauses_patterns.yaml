@@ -1,0 +1,30 @@
+# code_de_clause: liste de regex (insensibles à la casse)
+CAC_NOMINATION:
+  - "\\bcommissaire[s]?\\s+aux\\s+comptes?\\b"
+  - "\\bnomination\\s+du\\s+cac\\b"
+
+CAC_REPORT:
+  - "\\brapport\\s+du\\s+commissaire\\s+aux\\s+comptes?\\b"
+
+PV_AG:
+  - "\\bpv\\s+(d['e ]|de\\s+)assembl[ée]e?\\s+g[ée]n[ée]rale\\b"
+
+URBANISM_OK:
+  - "\\burbanisme\\s+ok\\b"
+  - "\\bbien\\s+en\\s+ordre\\s+d[’']urbanisme\\b"
+
+CENTRALIZED_ACCOUNT:
+  - "\\baircap\\b"
+  - "\\bibanfirst\\b"
+  - "\\bcompte\\s+centralisateur\\b"
+
+WARRANTY_TRUST_CASH:
+  - "\\bfiducie[-\\s]?s[uû]ret[eé]\\b"
+  - "\\bcompte\\s+centralisateur\\s+nanti\\b"
+
+MANUAL:
+  - "\\bdevis\\s+sign[é]s?\\b"
+  - "\\bkbis\\b"
+  - "\\bstatuts?\\b"
+  - "\\bcr[ée]ation\\s+de\\s+la\\s+soci[eé]t[eé]\\b"
+  - "\\blib[ée]ration\\s+du\\s+capital\\b"
