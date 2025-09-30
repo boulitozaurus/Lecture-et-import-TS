@@ -9,6 +9,13 @@ import yaml
 from src.parser.pdf_parser import parse_pdf
 from src.normalize import compute_derived_fields
 
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]  # remonte à la racine du repo
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 BASE = Path(__file__).resolve().parents[1]
 CONFIG = BASE / "src" / "config"
 CLAUSES = BASE / "src" / "clauses"
@@ -132,14 +139,3 @@ if uploaded:
 
     st.markdown("### Résumé")
     st.dataframe(_record_to_df(rec), use_container_width=True)
-
-    c1, c2 = st.columns(2)
-    with c1:
-        csv_buf = io.StringIO()
-        pd.DataFrame([rec]).to_csv(csv_buf, index=False)
-        st.download_button("⬇️ Télécharger CSV", csv_buf.getvalue(), file_name=uploaded.name.replace(".pdf",".csv"), mime="text/csv")
-    with c2:
-        st.download_button("⬇️ Télécharger JSON", json.dumps(rec, ensure_ascii=False, indent=2), file_name=uploaded.name.replace(".pdf",".json"), mime="application/json")
-
-else:
-    st.info("Déposez un fichier PDF pour démarrer.")
