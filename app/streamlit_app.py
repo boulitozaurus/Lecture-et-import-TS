@@ -1,69 +1,93 @@
-import io
-import json
-from pathlib import Path
-
-import streamlit as st
-import pandas as pd
-import yaml
-
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]  # remonte à la racine du repo
+ROOT = Path(__file__).resolve().parents[1]  # racine du repo
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-    
+
+import streamlit as st
+import pandas as pd
+import pdfplumber
+import yaml
+import re
+
 from src.parser.pdf_parser import parse_pdf
 from src.normalize import compute_derived_fields
 
-BASE = Path(__file__).resolve().parents[1]
-CONFIG = BASE / "src" / "config"
-CLAUSES = BASE / "src" / "clauses"
-OUTPUTS = BASE / "outputs"
+# -----------------------------
+# Config
+# -----------------------------
+CONFIG = ROOT / "src" / "config"
+CLAUSES = ROOT / "src" / "clauses"
+OUTPUTS = ROOT / "outputs"
 OUTPUTS.mkdir(exist_ok=True, parents=True)
 
-st.set_page_config(page_title="Term Sheet Parser", layout="wide")
+st.set_page_config(page_title="TS Parser", layout="wide")
+st.title("📄 Term Sheet Parser (Upload → Auto-remplissage)")
 
-st.title("📄 Term Sheet PDF Parser – LookandFin")
-st.caption("Uploader un PDF → extraction automatique → correction → export CSV/JSON")
+# Champs à afficher (ton ordre)
+FIELDS_ORDER = [
+    "Loan Amount Borrow",
+    "Financial Instrument",
+    "Spv",
+    "Loan Type",
+    "Loan Refund Periodicity",
+    "Loan Min Amount to raise",
+    "Loan Interest Rate",
+    "Timetable Type",
+    "Loan Duration",
+    "Loan Franchise duration",
+    "Commission Rate",
+    "Exit Fee Commission Rate",
+    "Periodicity Running Commission Rate",
+    "Fund Usage Description",
+    "LTV Max Ratio",
+    "LTV Max Pre construction Ratio",
+    "Financement de l'acquisition",
+    "Suspensives clauses",
+    "Loan Warranties",
+    "Caution personnelle",
+    "GAPD",
+    "Co-debitor",
+    "Subordinated Creditors",
+    "Loan Amount Start",
+    "Loan Amount Max",
+    "Loan Anticipated Refund",
+    "Loan Min Duration Before Early Repayment",
+]
 
-# --- Load choices ---
-with open(CONFIG / "choices.yaml", "r", encoding="utf-8") as f:
-    CHOICES = yaml.safe_load(f)
-loan_types = CHOICES.get("LoanType", [])
-periodicities = CHOICES.get("LoanRefundPeriodicity", [])
+# Champs constants (affichés dans la zone d’édition mais désactivés)
+CONSTANT_FIELDS = {
+    "Financial Instrument": "contrat de prêt",
+    "Spv": "LookandFin Finance",
+    "Timetable Type": "Amortissable",
+}
 
-# --- Load clauses from YAML (preferred) or fallback JSON ---
-def _flatten_clauses(obj):
-    if isinstance(obj, list):
-        return [str(x) for x in obj if str(x).strip()]
-    if isinstance(obj, dict):
-        out = []
-        for k, v in obj.items():
-            if isinstance(v, list):
-                out.extend([str(x) for x in v if str(x).strip()])
-            elif isinstance(v, str) and v.strip():
-                out.append(v.strip())
-        # dedupe while preserving order
+# Clauses suspensives (catalogue YAML optionnel)
+def load_clauses_catalog():
+    yml = CLAUSES / "clauses.yaml"
+    if yml.exists():
+        obj = yaml.safe_load(yml.read_text(encoding="utf-8"))
+        # aplatissement (liste ou catégories)
+        if isinstance(obj, list):
+            out = [str(x).strip() for x in obj if str(x).strip()]
+        elif isinstance(obj, dict):
+            out = []
+            for v in obj.values():
+                if isinstance(v, list):
+                    out.extend([str(x).strip() for x in v if str(x).strip()])
+                elif isinstance(v, str) and v.strip():
+                    out.append(v.strip())
+        else:
+            out = []
+        # unicité
         seen = set(); uniq = []
         for c in out:
             if c not in seen:
                 uniq.append(c); seen.add(c)
         return uniq
-    return []
-
-clauses_catalog = []
-yml = CLAUSES / "clauses.yaml"
-if yml.exists():
-    try:
-        obj = yaml.safe_load(yml.read_text(encoding="utf-8"))
-        clauses_catalog = _flatten_clauses(obj)
-    except Exception as e:
-        st.error(f"Erreur de lecture YAML: {e}")
-elif (CLAUSES / "clauses.json").exists():
-    clauses_catalog = json.loads((CLAUSES / "clauses.json").read_text(encoding="utf-8"))
-else:
-    clauses_catalog = [
+    # fallback minimal si pas de YAML
+    return [
         "Expertise indépendante (en l'état, après travaux, liquidative)",
         "Respect des covenants LTV (en l'état / post-travaux)",
         "Mise en place des sûretés (fiducie-sûreté / hypothèque)",
@@ -73,69 +97,168 @@ else:
         "Signature de la convention de prêt et PV nécessaires",
     ]
 
-# --- Sidebar controls ---
-with st.sidebar:
-    st.header("Contrôles")
-    default_loan_type = st.selectbox("Loan Type", loan_types, index=loan_types.index("Fiducie-sûreté") if "Fiducie-sûreté" in loan_types else 0)
-    default_periodicity = st.selectbox("Loan Refund Periodicity", periodicities, index=0)
-    st.caption("Clauses suspensives (sélection multiple)")
-    sel_clauses = st.multiselect("Ajouter au Term Sheet", clauses_catalog, default=[])
-    st.divider()
-    st.caption("Champs constants")
-    st.text_input("Financial Instrument", value="contrat de prêt", key="const_financial_instrument", disabled=True)
-    st.text_input("SPV", value="LookandFin Finance", key="const_spv", disabled=True)
-    st.text_input("Timetable Type", value="Amortissable", key="const_timetable", disabled=True)
+CLAUSES_CATALOG = load_clauses_catalog()
 
-uploaded = st.file_uploader("Déposez un PDF de proposition de financement", type=["pdf"])
+# -----------------------------
+# Heuristiques (aucun choix utilisateur avant upload)
+# -----------------------------
+def guess_loan_type(text: str) -> str | None:
+    t = text.lower()
+    if "fiducie" in t or "fiducie-sûreté" in t or "fiducie surete" in t:
+        return "Fiducie-sûreté"
+    if "garantie hypothéc" in t:
+        return "Garantie hypothécaire de premier rang"
+    if "non assur" in t:
+        return "Non assuré"
+    if "assur" in t:
+        return "Assuré"
+    if "pmv" in t:
+        return "PMV"
+    if "wininlening" in t:
+        return "Wininlening"
+    if "proxi" in t:
+        return "Prêt proxi"
+    if "coup de pouce" in t:
+        return "Prêt coup de pouce"
+    return None
 
-def _record_to_df(rec: dict) -> pd.DataFrame:
-    return pd.DataFrame([rec])
+def guess_periodicity(text: str) -> str | None:
+    t = text.lower()
+    # repérage mots-clés
+    if "mensuel" in t or "mensuelle" in t or "mensualit" in t:
+        return "Mensuelle"
+    if "trimestriel" in t or "trimestrielle" in t:
+        return "Trimestrielle"
+    if "semestriel" in t or "semestrielle" in t:
+        return "Semestrielle"
+    if "annuel" in t or "annuelle" in t:
+        return "Annuelle"
+    return None
+
+def detect_clauses(text: str, catalog: list[str]) -> list[str]:
+    """Détecte les clauses présentes dans le texte du PDF (substring insensible à la casse).
+       Simple et robuste. Tu pourras raffiner plus tard (regex/keywords)."""
+    t = re.sub(r"\s+", " ", text or "").lower()
+    found = []
+    for clause in catalog:
+        c = re.sub(r"\s+", " ", clause).lower()
+        if len(c) >= 6 and c in t:
+            found.append(clause)
+    # unicité, ordre d’apparition dans catalog
+    seen = set(); uniq = []
+    for c in found:
+        if c not in seen:
+            uniq.append(c); seen.add(c)
+    return uniq
+
+# -----------------------------
+# UI minimale : juste un uploader
+# -----------------------------
+uploaded = st.file_uploader("Dépose ton PDF de Term Sheet", type=["pdf"])
+
+def to_kv_dataframe(rec: dict) -> pd.DataFrame:
+    """Sécurise l’affichage contre pyarrow/Overflow: tout en texte, 2 colonnes."""
+    rows = []
+    for k in FIELDS_ORDER:
+        if k in rec:
+            v = rec.get(k, "")
+            # stringify propre
+            if v is None:
+                s = ""
+            elif isinstance(v, (int, float, bool)):
+                s = str(v)
+            else:
+                s = str(v)
+            rows.append({"Field": k, "Value": s})
+    # Ajoute les clés non listées (au cas où)
+    for k, v in rec.items():
+        if k not in FIELDS_ORDER:
+            rows.append({"Field": k, "Value": str(v)})
+    df = pd.DataFrame(rows)
+    # tout en string pour éviter toute conversion Arrow hasardeuse
+    return df.astype({"Field": "string", "Value": "string"})
 
 if uploaded:
     pdf_path = OUTPUTS / uploaded.name
     pdf_path.write_bytes(uploaded.getvalue())
 
-    with st.spinner("Extraction en cours..."):
-        raw = parse_pdf(str(pdf_path))
-        raw.setdefault("Loan Type", default_loan_type)
-        raw.setdefault("Loan Refund Periodicity", default_periodicity)
-        if sel_clauses:
-            raw["Suspensives clauses"] = "; ".join(sel_clauses)
-        raw["Financial Instrument"] = "contrat de prêt"
-        raw["Spv"] = "LookandFin Finance"
-        raw["Timetable Type"] = "Amortissable"
-        rec = compute_derived_fields(raw)
+    # 1) extraction brut (clé/valeur) via parseur
+    raw = parse_pdf(str(pdf_path))
 
-    st.subheader("Champs extraits (éditables)")
+    # 2) lecture texte complet pour heuristiques (type, périodicité, clauses)
+    with pdfplumber.open(str(pdf_path)) as pdf:
+        full_text = "\n".join([p.extract_text() or "" for p in pdf.pages])
+
+    # 3) constantes imposées (visibles mais non modifiables + utilisées au calcul)
+    for k, v in CONSTANT_FIELDS.items():
+        raw[k] = v
+
+    # 4) heuristiques automatiques (pas de sidebar)
+    lt = guess_loan_type(full_text)
+    if lt:
+        raw["Loan Type"] = lt
+    pr = guess_periodicity(full_text)
+    if pr:
+        raw["Loan Refund Periodicity"] = pr
+
+    # 5) détection automatique des clauses
+    clauses_found = detect_clauses(full_text, CLAUSES_CATALOG)
+    if clauses_found:
+        raw["Suspensives clauses"] = "; ".join(clauses_found)
+
+    # 6) normalisation + règles dérivées (min à lever, franchise, etc.)
+    rec = compute_derived_fields(raw)
+
+    # 7) Formulaire d’édition (les champs constants sont désactivés)
+    st.subheader("Champs pré-remplis")
     with st.form("edit_form"):
         col1, col2 = st.columns(2)
-        editable = {}
+        edited = {}
 
+        def text_input_disabled(label, value):
+            # champ 'readonly' visuellement cohérent
+            st.text_input(label, value=value, disabled=True)
+
+        # Colonne 1
         with col1:
-            editable["Deal Name"] = st.text_input("Deal Name", value=uploaded.name.replace(".pdf",""))
-            editable["Loan Amount Borrow"] = st.text_input("Loan Amount Borrow (EUR)", value=str(rec.get("Loan Amount Borrow","")))
-            editable["Loan Interest Rate"] = st.text_input("Loan Interest Rate (%)", value=str(rec.get("Loan Interest Rate","")))
-            editable["Loan Duration"] = st.text_input("Loan Duration (months)", value=str(rec.get("Loan Duration","")))
-            editable["Loan Franchise duration"] = st.text_input("Loan Franchise duration (months)", value=str(rec.get("Loan Franchise duration","")))
-            editable["Commission Rate"] = st.text_input("Commission Rate (%)", value=str(rec.get("Commission Rate","5")))
-            editable["Exit Fee Commission Rate"] = st.text_input("Exit Fee Commission Rate (%)", value=str(rec.get("Exit Fee Commission Rate","0")))
-            editable["Periodicity Running Commission Rate"] = st.text_input("Periodicity Running Commission Rate", value=str(rec.get("Periodicity Running Commission Rate","Mensuelle (0,1%)")))
+            # constants (affichés mais désactivés)
+            for ck in ["Financial Instrument", "Spv", "Timetable Type"]:
+                text_input_disabled(ck, str(rec.get(ck, CONSTANT_FIELDS.get(ck, ""))))
+            # éditables
+            edited["Loan Amount Borrow"] = st.text_input("Loan Amount Borrow (EUR)", str(rec.get("Loan Amount Borrow", "")))
+            edited["Loan Interest Rate"] = st.text_input("Loan Interest Rate (%)", str(rec.get("Loan Interest Rate", "")))
+            edited["Loan Duration"] = st.text_input("Loan Duration (months)", str(rec.get("Loan Duration", "")))
+            edited["Loan Franchise duration"] = st.text_input("Loan Franchise duration (months)", str(rec.get("Loan Franchise duration", "")))
+            edited["Commission Rate"] = st.text_input("Commission Rate (%)", str(rec.get("Commission Rate", "5")))
+            edited["Exit Fee Commission Rate"] = st.text_input("Exit Fee Commission Rate (%)", str(rec.get("Exit Fee Commission Rate", "0")))
 
+        # Colonne 2
         with col2:
-            editable["Loan Type"] = st.selectbox("Loan Type", loan_types, index=loan_types.index(rec.get("Loan Type", default_loan_type)) if rec.get("Loan Type", default_loan_type) in loan_types else 0)
-            editable["Loan Refund Periodicity"] = st.selectbox("Loan Refund Periodicity", periodicities, index=periodicities.index(rec.get("Loan Refund Periodicity", default_periodicity)) if rec.get("Loan Refund Periodicity", default_periodicity) in periodicities else 0)
-            editable["LTV Max Ratio"] = st.text_input("LTV Max Ratio (%)", value=str(rec.get("LTV Max Ratio","")))
-            editable["LTV Max Pre construction Ratio"] = st.text_input("LTV Max Pre construction Ratio (%)", value=str(rec.get("LTV Max Pre construction Ratio","")))
-            editable["Fund Usage Description"] = st.text_area("Fund Usage Description", value=str(rec.get("Fund Usage Description","")), height=120)
-            editable["Financement de l'acquisition"] = st.selectbox("Financement de l'acquisition", ["Oui","Non"], index=0 if str(rec.get("Financement de l'acquisition","Oui")).lower().startswith("o") else 1)
-            editable["Loan Anticipated Refund"] = st.selectbox("Loan Anticipated Refund", ["Oui","Non"], index=0 if str(rec.get("Loan Anticipated Refund","Non")).lower().startswith("o") else 1)
-            editable["Loan Warranties"] = st.text_area("Loan Warranties", value=str(rec.get("Loan Warranties","")), height=60)
+            edited["Loan Type"] = st.text_input("Loan Type", str(rec.get("Loan Type", "")))
+            edited["Loan Refund Periodicity"] = st.text_input("Loan Refund Periodicity", str(rec.get("Loan Refund Periodicity", "")))
+            edited["LTV Max Ratio"] = st.text_input("LTV Max Ratio (%)", str(rec.get("LTV Max Ratio", "")))
+            edited["LTV Max Pre construction Ratio"] = st.text_input("LTV Max Pre construction Ratio (%)", str(rec.get("LTV Max Pre construction Ratio", "")))
+            edited["Fund Usage Description"] = st.text_area("Fund Usage Description", str(rec.get("Fund Usage Description", "")), height=120)
+            edited["Periodicity Running Commission Rate"] = st.text_input("Periodicity Running Commission Rate", str(rec.get("Periodicity Running Commission Rate", "Mensuelle (0,1%)")))
 
-        submitted = st.form_submit_button("Valider les modifications")
+        # Ligne 3 (pleine largeur) pour autres drapeaux
+        edited["Financement de l'acquisition"] = st.text_input("Financement de l'acquisition", str(rec.get("Financement de l'acquisition", "")))
+        edited["Loan Warranties"] = st.text_input("Loan Warranties", str(rec.get("Loan Warranties", "")))
+        edited["Loan Anticipated Refund"] = st.text_input("Loan Anticipated Refund", str(rec.get("Loan Anticipated Refund", "")))
+        edited["Loan Min Duration Before Early Repayment"] = st.text_input("Loan Min Duration Before Early Repayment (months)", str(rec.get("Loan Min Duration Before Early Repayment", "")))
+        # Clauses détectées : visibles mais éditables aussi si tu veux corriger
+        edited["Suspensives clauses"] = st.text_area("Suspensives clauses (auto-détectées)", str(rec.get("Suspensives clauses", "")), height=100)
+
+        submitted = st.form_submit_button("Appliquer")
         if submitted:
-            rec.update(editable)
+            rec.update(edited)
             rec = compute_derived_fields(rec)
             st.success("Champs mis à jour")
 
-    st.markdown("### Résumé")
-    st.dataframe(_record_to_df(rec), use_container_width=True)
+    st.markdown("### Résumé (clé / valeur)")
+    df = to_kv_dataframe(rec)
+    # data en texte => pas d'overflow pyarrow
+    st.dataframe(df, use_container_width=True)
+
+else:
+    st.info("Dépose un fichier PDF pour démarrer.")
