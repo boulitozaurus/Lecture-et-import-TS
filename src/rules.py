@@ -1,30 +1,46 @@
+# src/rules.py
 import re
 from typing import Dict, Any, List
 from pathlib import Path
-import yaml
+
+try:
+    import yaml
+except Exception:
+    yaml = None  # le code fonctionne aussi sans yaml (fallback interne)
 
 BASE = Path(__file__).resolve().parents[1]
-CLAUSES_CFG = BASE / "clauses" / "clauses_patterns.yaml"
+CLAUSES_CFG = BASE / "src" / "clauses" / "clauses_patterns.yaml"
+
+# Fallback interne si le YAML n'est pas présent
+DEFAULT_CLAUSE_PATTERNS: Dict[str, List[str]] = {
+    "CAC_NOMINATION": [r"\bcommissaire[s]?\s+aux\s+comptes?\b", r"\bnomination\s+du\s+cac\b"],
+    "CAC_REPORT": [r"\brapport\s+du\s+commissaire\s+aux\s+comptes?\b"],
+    "PV_AG": [r"\bpv\s+(d['e ]|de\s+)assembl[ée]e?\s+g[ée]n[ée]rale\b"],
+    "URBANISM_OK": [r"\burbanisme\s+ok\b", r"\bbien\s+en\s+ordre\s+d[’']urbanisme\b"],
+    "CENTRALIZED_ACCOUNT": [r"\baircap\b", r"\bibanfirst\b", r"\bcompte\s+centralisateur\b"],
+    "WARRANTY_TRUST_CASH": [r"\bfiducie[-\s]?s[uû]ret[eé]\b", r"\bcompte\s+centralisateur\s+nanti\b"],
+    "MANUAL": [r"\bdevis\s+sign[é]s?\b", r"\bkbis\b", r"\bstatuts?\b",
+               r"\bcr[ée]ation\s+de\s+la\s+soci[eé]t[eé]\b", r"\blib[ée]ration\s+du\s+capital\b"],
+}
 
 def _load_clause_patterns() -> Dict[str, List[str]]:
-    """YAML: code_de_clause -> liste de regex (insensibles à la casse)."""
-    if CLAUSES_CFG.exists():
-        return yaml.safe_load(CLAUSES_CFG.read_text(encoding="utf-8")) or {}
-    # fallback minimal si fichier manquant
-    return {
-        "CAC_NOMINATION": [r"\bcommissaire[s]?\s+aux\s+comptes?\b", r"\bnomination\s+du\s+cac\b"],
-        "CAC_REPORT": [r"\brapport\s+du\s+commissaire\s+aux\s+comptes?\b"],
-        "PV_AG": [r"\bpv\s+(d['e ]|de\s+)assembl[ée]e?\s+g[ée]n[ée]rale\b"],
-        "URBANISM_OK": [r"\burbanisme\s+ok\b", r"\bbien\s+en\s+ordre\s+d[’']urbanisme\b"],
-        "CENTRALIZED_ACCOUNT": [r"\baircap\b", r"\bibanfirst\b", r"\bcompte\s+centralisateur\b"],
-        "WARRANTY_TRUST_CASH": [r"\bfiducie[-\s]?s[uû]ret[eé]\b", r"\bcompte\s+centralisateur\s+nanti\b"],
-        "MANUAL": [r"\bdevis\s+sign[é]s?\b", r"\bkbis\b", r"\bstatuts?\b", r"\bcr[ée]ation\s+de\s+la\s+soci[eé]t[eé]\b", r"\blib[ée]ration\s+du\s+capital\b"],
-    }
+    if yaml is None or not CLAUSES_CFG.exists():
+        return DEFAULT_CLAUSE_PATTERNS
+    try:
+        data = yaml.safe_load(CLAUSES_CFG.read_text(encoding="utf-8")) or {}
+        # validation simple
+        ok: Dict[str, List[str]] = {}
+        for k, v in data.items():
+            if isinstance(v, list):
+                ok[k] = [str(x) for x in v if str(x).strip()]
+        return ok or DEFAULT_CLAUSE_PATTERNS
+    except Exception:
+        return DEFAULT_CLAUSE_PATTERNS
 
 CLAUSE_PATTERNS = _load_clause_patterns()
 
 def _contains(text: str, pat: str) -> bool:
-    return re.search(pat, text, flags=re.I|re.S) is not None
+    return re.search(pat, text, flags=re.I | re.S) is not None
 
 def infer_periodicity(text: str) -> str | None:
     t = text.lower()
@@ -39,12 +55,11 @@ def infer_periodicity(text: str) -> str | None:
     return None
 
 def infer_loan_type(text: str, warranties: str | None, rate: float | None) -> str | None:
-    # Règle DOCX: si taux ≠ {7, 7.5, 8} -> risk class A+ -> Assuré
+    # Règle DOCX: si taux ≠ {7, 7.5, 8} => class A+ => "Assuré"
     if rate is not None and (rate not in {7.0, 7.5, 8.0}):
         return "Assuré"
-    # Sinon: déduction sur la base des sûretés
-    w = (warranties or "") + "\n" + text
-    w = w.lower()
+    # Sinon, déduire via les sûretés/texte
+    w = ((warranties or "") + "\n" + text).lower()
     if "fiducie" in w:
         return "Fiducie-sûreté"
     if "hypoth" in w:
@@ -57,16 +72,13 @@ def infer_loan_type(text: str, warranties: str | None, rate: float | None) -> st
         return "Prêt proxi"
     if "coup de pouce" in w:
         return "Prêt coup de pouce"
-    # fallback
     return "Non assuré"
 
 def detect_anticipated_refund(text: str) -> tuple[str | None, int | None]:
     t = text.lower()
     if "remboursement anticip" in t and "sans frais" in t:
-        # cherche éventuellement un palier minimum (ex: 6 mois)
         m = re.search(r"(?:apr[eè]s|après)\s+(\d+)\s+mois", t)
         min_months = int(m.group(1)) if m else None
-        # Si fenêtre conditionnelle : on marque "Partially" sinon "Oui"
         kind = "Partially" if min_months else "Oui"
         return kind, min_months
     return None, None
@@ -77,8 +89,7 @@ def detect_centralizer(text: str) -> str:
         return "IbanFirst"
     if "aircap" in t:
         return "Aircap"
-    # fallback (DOCX)
-    return "Aircap"
+    return "Aircap"  # fallback demandé
 
 def detect_clauses(text: str) -> List[str]:
     found = []
@@ -87,7 +98,6 @@ def detect_clauses(text: str) -> List[str]:
             if _contains(text, pat):
                 found.append(code)
                 break
-    # unicité et ordre de config
     seen = set(); uniq = []
     for c in found:
         if c not in seen:
@@ -110,10 +120,10 @@ def detect_covenants(text: str) -> List[str]:
     return cov
 
 def apply_rules(data: Dict[str, Any], full_text: str) -> Dict[str, Any]:
-    """Applique toutes les règles du prompt DOCX sur les données brutes extraites."""
+    """Applique les règles métier (DOCX) sur les données extraites."""
     out = dict(data)
 
-    # Périodicité (pas de sidebar)
+    # Périodicité
     per = infer_periodicity(full_text)
     if per:
         out["Loan Refund Periodicity"] = per
@@ -125,7 +135,7 @@ def apply_rules(data: Dict[str, Any], full_text: str) -> Dict[str, Any]:
     if min_months is not None:
         out["Loan Min Duration Before Early Repayment"] = min_months
 
-    # Centralisateur (et clause)
+    # Centralisateur + clause
     central = detect_centralizer(full_text)
     out["Centralising Account Provider"] = central
     clauses = detect_clauses(full_text)
@@ -134,22 +144,18 @@ def apply_rules(data: Dict[str, Any], full_text: str) -> Dict[str, Any]:
     if clauses:
         out["Suspensives clauses"] = "; ".join(clauses)
 
-    # Covenants (si tu veux les stocker en champ texte)
+    # Covenants (facultatif, en champ texte)
     covs = detect_covenants(full_text)
     if covs:
         out["Covenants"] = "; ".join(covs)
 
-    # Déduction Loan Type (sans valeurs par défaut pour commissions)
-    # On convertit le taux si déjà normalisé ailleurs -> on tente quand même
+    # Loan Type (taux déjà normalisé ou pas)
     rate = None
     try:
         rate = float(str(out.get("Loan Interest Rate","")).replace(",", "."))
     except Exception:
         pass
-
     out["Loan Type"] = infer_loan_type(full_text, out.get("Loan Warranties"), rate)
 
-    # NE PAS remplir Commission Rate / Periodicity Running Commission Rate si absents
-    # (Ils resteront vides si la TS ne les contient pas)
-
+    # IMPORTANT : pas de défaut pour Commission Rate / Periodicity Running Commission Rate
     return out
