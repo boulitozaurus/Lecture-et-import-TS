@@ -1,10 +1,20 @@
-# --- MUST BE FIRST: make project root importable ---
-import sys
+# --- MUST BE FIRST: make 'src' importable no matter the launch dir ---
+import sys, importlib.util
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]  # racine du repo
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+HERE = Path(__file__).resolve()
+
+def _ensure_src_on_path() -> Path | None:
+    # essaie parent, grand-parent, cwd, puis remonte l'arbo jusqu'à trouver 'src'
+    candidates = [HERE.parent, HERE.parent.parent, HERE.parent.parent.parent, Path.cwd()]
+    for base in candidates + list(HERE.parents):
+        if (base / "src").exists():
+            if str(base) not in sys.path:
+                sys.path.insert(0, str(base))
+            return base
+    return None
+
+PROJECT_ROOT = _ensure_src_on_path()
 
 import streamlit as st
 import pandas as pd
