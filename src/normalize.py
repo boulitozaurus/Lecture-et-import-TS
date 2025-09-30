@@ -27,7 +27,7 @@ def _int_from_text(s: str):
 def compute_derived_fields(data: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(data)
 
-    # Constantes (déjà injectées par l’app, on les confirme)
+    # Constantes
     out.setdefault("Financial Instrument", "contrat de prêt")
     out.setdefault("Spv", "LookandFin Finance")
     out.setdefault("Timetable Type", "Amortissable")
@@ -40,7 +40,7 @@ def compute_derived_fields(data: Dict[str, Any]) -> Dict[str, Any]:
         out["Loan Amount Start"] = out.get("Loan Amount Start", amt)
         out["Loan Amount Max"] = out.get("Loan Amount Max", amt)
 
-    # Taux (%)
+    # Taux
     rate = _pct_to_float(out.get("Loan Interest Rate"))
     if rate is not None:
         out["Loan Interest Rate"] = rate
@@ -51,7 +51,7 @@ def compute_derived_fields(data: Dict[str, Any]) -> Dict[str, Any]:
         out["Loan Duration"] = dur
         out["Loan Franchise duration"] = out.get("Loan Franchise duration", max(dur - 1, 0))
 
-    # Commissions -> PAS de valeur par défaut si manquantes
+    # Commissions -> PAS de valeurs par défaut
     cr = _pct_to_float(out.get("Commission Rate"))
     if cr is not None:
         out["Commission Rate"] = cr
@@ -68,11 +68,11 @@ def compute_derived_fields(data: Dict[str, Any]) -> Dict[str, Any]:
     if ltv_pre is not None:
         out["LTV Max Pre construction Ratio"] = ltv_pre
 
-    # Booléens par défaut si absents
+    # Booléens (par défaut Non si absents)
     for f in ["Caution personnelle","GAPD","Co-debitor","Subordinated Creditors"]:
         out.setdefault(f, "Non")
 
-    # Remboursement anticipé: valeur par défaut = Non si absent
+    # Remboursement anticipé: défaut Non si absent
     out.setdefault("Loan Anticipated Refund", "Non")
 
     return out
