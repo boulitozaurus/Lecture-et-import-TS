@@ -6,15 +6,15 @@ import streamlit as st
 import pandas as pd
 import yaml
 
-from src.parser.pdf_parser import parse_pdf
-from src.normalize import compute_derived_fields
-
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]  # remonte à la racine du repo
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+    
+from src.parser.pdf_parser import parse_pdf
+from src.normalize import compute_derived_fields
 
 BASE = Path(__file__).resolve().parents[1]
 CONFIG = BASE / "src" / "config"
