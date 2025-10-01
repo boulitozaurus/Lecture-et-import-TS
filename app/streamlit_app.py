@@ -20,6 +20,233 @@ OUTPUTS.mkdir(parents=True, exist_ok=True)
 st.set_page_config(page_title="TS – Lecteur robuste → Tuples", layout="wide")
 st.title("📄 Lecteur PDF → Tuples (robuste, sans mapping)")
 
+# ================== ANCRAGE SUR TES LABELS ==================
+# 1) Tes labels "toujours vrais" + regex tolérantes (accents / variantes / articles)
+CANON_LABELS: dict[str, list[str]] = {
+    "Porteur de projet": [r"\bporteur\s+de\s+projet\b"],
+    "Objet de prêt obligataire": [r"\bobjet\s+d[eu]\s+pr[ée]t\s+obligataire\b"],
+    "Montant total du prêt obligataire": [r"\bmontant\s+total\s+du\s+pr[ée]t\s+obligataire\b"],
+    "Taux d'intérêt annuel": [r"\btaux\s+d['’]int[ée]r[êe]t\s+annuel\b"],
+    "Durée (mois)": [r"\bdur[ée]e\s*\(\s*mois\s*\)\b"],
+    "Modalités de remboursement": [r"\bmodalit[ée]s?\s+de\s+remboursement\b"],
+    "Remboursement anticipé sans frais": [r"\bremboursement\s+anticip[ée]\s+sans\s+frais\b"],
+    "Sûretés": [r"\bs[uû]ret[ée]s?\b"],
+    "Caution": [r"\bcaution\b"],
+    "GADP": [r"\bga[dp]p\b"],  # tolère GADP / GAPD
+    "Engagements irrévocables et inconditionnels": [r"\bengagements?\s+irrevocables?\s+et\s+inconditionnels?\b"],
+    "Frais de structuration": [r"\bfrais\s+de\s+structuration\b"],
+    "Exit fees": [r"\bexit\s+fees?\b"],
+    "Frais de gestion mensuels": [r"\bfrais\s+de\s+gestion\s+mensuel(?:le)?s?\b"],
+    "Prime d'assurance": [r"\bprime\s+d['’]assurance\b"],
+    "Validité de l'offre": [r"\bvalidit[ée]\s+de\s+l['’]offre\b"],
+    "Reporting": [r"\breporting\b"],
+    "Covenants": [r"\bcovenants?\b"],
+    "Conditions préalables à la signature d'une convention cadre": [
+        r"\bconditions?\s+pr[ée]alables?\s+à\s+la\s+signature\s+d['’]une\s+convention\s+cadre\b"
+    ],
+    "Conditions préalables à la mise en ligne": [
+        r"\bconditions?\s+pr[ée]alables?\s+à\s+la\s+mise\s+en\s+ligne\b"
+    ],
+    "Conditions suspensives à la libération des fonds": [
+        r"\bconditions?\s+suspensives?\s+à\s+la\s+lib[ée]ration\s+des?\s+fonds?\b"
+    ],
+    "Libération des fonds": [r"\blib[ée]ration\s+des?\s+fonds?\b"],
+}
+
+BULLET_RE   = re.compile(r"^[•●▪·\-–]+\s*")
+ENUM_RE     = re.compile(r"^(?:\d+[\.\)]|[a-z]\))\s+")
+PAIR_SEP_RE = re.compile(r"^(.{2,200}?)\s*[:\-–]\s*(.+)$")
+NOTE_RE     = re.compile(r"^note\s+\d+\b", re.I)
+
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+# ---- Extraction de lignes + caractères (bbox) ----
+def _get_lines_with_chars(page: fitz.Page):
+    d = page.get_text("rawdict")
+    out = []
+    for blk in d.get("blocks", []):
+        for li in blk.get("lines", []):
+            spans = li.get("spans", [])
+            if not spans:
+                continue
+            x0 = y0 = float("inf")
+            x1 = y1 = float("-inf")
+            chars = []
+            buf = []
+            for sp in spans:
+                for ch in sp.get("chars", []):
+                    cx0, cy0, cx1, cy1 = ch["bbox"]
+                    x0 = min(x0, cx0); y0 = min(y0, cy0)
+                    x1 = max(x1, cx1); y1 = max(y1, cy1)
+                    buf.append(ch.get("c", ""))
+                    chars.append((cx0, cx1, cy0, cy1))
+            text = _norm("".join(buf))
+            if text:
+                out.append({"x0": x0, "x1": x1, "y0": y0, "y1": y1, "y": (y0+y1)/2, "w": x1-x0, "text": text, "chars": chars})
+    return sorted(out, key=lambda r: (r["y"], r["x0"]))
+
+# ---- Césure par vallée de densité de caractères ----
+def _compute_split_x(lines, bins=96):
+    if not lines:
+        return None
+    xmin = min(l["x0"] for l in lines); xmax = max(l["x1"] for l in lines)
+    if xmax <= xmin:
+        return None
+    step = (xmax - xmin) / bins
+    hist = [0.0] * bins
+    for l in lines:
+        for (cx0, cx1, _, _) in l["chars"]:
+            i0 = int(max(0, min(bins-1, (cx0 - xmin) // step)))
+            i1 = int(max(0, min(bins-1, (cx1 - xmin) // step)))
+            for i in range(i0, i1+1):
+                hist[i] += 1.0
+    mid = bins // 2
+    left_peak  = max(range(0, mid), key=lambda i: hist[i]) if any(hist[:mid]) else 0
+    right_peak = max(range(mid, bins), key=lambda i: hist[i]) if any(hist[mid:]) else bins-1
+    if right_peak - left_peak >= 4:
+        valley = min(range(left_peak+1, right_peak), key=lambda i: hist[i])
+        return xmin + valley * step
+    # fallback médiane des centres
+    centers = [ (l["x0"]+l["x1"]) / 2 for l in lines ]
+    return statistics.median(centers)
+
+def _char_coverage_ratio(line, split_x: float):
+    left = right = 0.0
+    for (cx0, cx1, _, _) in line["chars"]:
+        w = max(0.0, cx1 - cx0)
+        if ((cx0 + cx1) / 2.0) <= split_x:
+            left += w
+        else:
+            right += w
+    tot = left + right
+    if tot <= 0:
+        return 0.5, 0.5
+    return left / tot, right / tot
+
+# ---- Matching d’ancre (label) avec tes regex ----
+def _match_canonical_label(text: str) -> str | None:
+    t = text.lower()
+    for canonical, patterns in CANON_LABELS.items():
+        for pat in patterns:
+            if re.search(pat, t, flags=re.I):
+                return canonical
+    return None
+
+def _merge_left_labels_if_no_right_between(left, right, y_pad=2.0):
+    merged = []
+    i = 0
+    while i < len(left):
+        y0 = left[i]["y"]; txt = left[i]["text"]
+        j = i + 1
+        while j < len(left):
+            y1 = left[j]["y"]
+            if any((y0 - y_pad) <= r["y"] < (y1 - y_pad) for r in right):
+                break
+            # tenter de fusionner plusieurs lignes pour matcher une ancre longue
+            cand = _norm(txt + " " + left[j]["text"])
+            if _match_canonical_label(cand):
+                txt = cand
+                j += 1
+            else:
+                break
+        merged.append({"y": y0, "text": _norm(txt)})
+        i = j
+    return merged
+
+def _split_value_segments(lines_texts: list[str]) -> list[str]:
+    segs, buf = [], []
+    def flush():
+        if buf:
+            s = _norm(" ".join(buf))
+            if s:
+                segs.append(s)
+        buf.clear()
+    for t in lines_texts:
+        if BULLET_RE.match(t) or PAIR_SEP_RE.match(t):
+            flush()
+            t2 = BULLET_RE.sub("", t, count=1).strip()
+            if t2:
+                segs.append(t2)
+        else:
+            buf.append(t)
+    flush()
+    return segs if segs else [""]
+
+# ---- Parse principal basé sur TES ancres ----
+def _pairs_with_anchors(page: fitz.Page, y_pad=3.0, left_threshold=0.6):
+    lines = _get_lines_with_chars(page)
+    if not lines:
+        return []
+
+    split_x = _compute_split_x(lines)
+    if split_x is None:
+        return []
+
+    # 1) Classement gauche/droite par couverture + forçages évidents
+    left_candidates, right_candidates = [], []
+    for ln in lines:
+        lg, _rg = _char_coverage_ratio(ln, split_x)
+        txt = ln["text"]
+        force_right = BULLET_RE.match(txt) or ENUM_RE.match(txt) or NOTE_RE.match(txt)
+        if force_right:
+            right_candidates.append({"y": ln["y"], "text": txt})
+        else:
+            (left_candidates if lg >= left_threshold else right_candidates).append({"y": ln["y"], "text": txt})
+
+    left_candidates  = sorted(left_candidates, key=lambda d: d["y"])
+    right_candidates = sorted(right_candidates, key=lambda d: d["y"])
+
+    # 2) Ne garder comme labels que ceux qui matchent TES ancres
+    left_candidates = _merge_left_labels_if_no_right_between(left_candidates, right_candidates, y_pad=y_pad)
+    anchors = []
+    for ln in left_candidates:
+        canon = _match_canonical_label(ln["text"])
+        if canon:
+            anchors.append({"y": ln["y"], "label": canon})
+    anchors = sorted(anchors, key=lambda a: a["y"])
+
+    if not anchors:
+        return []  # aucune ancre reconnue sur cette page
+
+    # 3) Associer chaque ancre aux valeurs droites jusqu’à l’ancre suivante
+    tuples = []
+    ridx = 0
+    for i, anc in enumerate(anchors):
+        y0 = anc["y"]
+        y1 = anchors[i+1]["y"] if i+1 < len(anchors) else float("inf")
+
+        while ridx < len(right_candidates) and right_candidates[ridx]["y"] < y0 - y_pad:
+            ridx += 1
+        bucket = []
+        j = ridx
+        while j < len(right_candidates) and right_candidates[j]["y"] < y1 - y_pad:
+            bucket.append(right_candidates[j]["text"])
+            j += 1
+        if not bucket:
+            continue
+
+        segments = _split_value_segments(bucket)
+
+        # Cas "Modalités de remboursement" → découpe par " et "
+        if anc["label"] == "Modalités de remboursement":
+            final = []
+            for seg in segments:
+                if " et " in seg:
+                    final.extend([p.strip() for p in seg.split(" et ") if p.strip()])
+                else:
+                    final.append(seg)
+            segments = final
+
+        for seg in segments:
+            tuples.append({
+                "page": str(page.number + 1),
+                "label": anc["label"],   # canonique et stable
+                "value": seg
+            })
+    return tuples
+# ================== FIN ANCRAGE ==================
+
 # ---------------------------------------------
 # Utils (aucun mapping; reconstruction 2 colonnes)
 # ---------------------------------------------
@@ -395,7 +622,11 @@ if uploaded:
     with fitz.open(str(pdf_path)) as doc:
         tuples = []
         for page in doc:
-            tuples.extend(_two_column_pairs_from_grid(page))
+            page_tuples = _pairs_with_anchors(page)
+            if not page_tuples:
+                page_tuples = _two_column_pairs_from_grid(page)
+
+            tuples.extend(page_tuples)
 
     # Affichage (full texte)
     def _to_df(rows):
