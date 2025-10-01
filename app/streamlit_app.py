@@ -87,6 +87,18 @@ def _get_lines_with_chars(page: fitz.Page):
     return sorted(out, key=lambda r: (r["y"], r["x0"]))
 
 # ---- Césure par vallée de densité de caractères ----
+def _iter_char_xspans(chars):
+    """
+    Rend (cx0, cx1) pour chaque caractère, que 'chars' contienne
+    (cx0, cx1, cy0, cy1) ou (cx0, cx1, cy0, cy1, c).
+    """
+    for ch in chars:
+        if isinstance(ch, (tuple, list)) and len(ch) >= 2:
+            try:
+                yield float(ch[0]), float(ch[1])
+            except Exception:
+                continue
+
 def _compute_split_x(lines, bins=96):
     if not lines:
         return None
@@ -96,7 +108,7 @@ def _compute_split_x(lines, bins=96):
     step = (xmax - xmin) / bins
     hist = [0.0] * bins
     for l in lines:
-        for (cx0, cx1, _, _) in l["chars"]:
+        for cx0, cx1 in _iter_char_xspans(l["chars"]):
             i0 = int(max(0, min(bins-1, (cx0 - xmin) // step)))
             i1 = int(max(0, min(bins-1, (cx1 - xmin) // step)))
             for i in range(i0, i1+1):
@@ -250,7 +262,6 @@ def _pairs_with_anchors(page: fitz.Page, y_pad=3.0, left_threshold=0.6):
 # ---------------------------------------------
 # Utils (aucun mapping; reconstruction 2 colonnes)
 # ---------------------------------------------
-BULLET_RE   = re.compile(r"^[•●▪·\-–]+[\s]*")
 ENUM_RE     = re.compile(r"^(?:\d+[\.\)]|[a-z]\))\s+")
 PAIR_SEP_RE = re.compile(r"^(.{2,160}?)\s*[:\-–]\s*(.+)$")
 
@@ -355,34 +366,6 @@ def _split_value_segments(lines_texts):
 # Classe chaque ligne par couverture de caractères à gauche vs droite d'une césure.
 # Utilisé quand _two_column_pairs_from_grid ne trouve pas de césure de tableau.
 
-NOTE_RE     = re.compile(r"^note\s+\d+\b", re.I)  # si absent, réutiliser NOTE_RE déjà défini
-# BULLET_RE, ENUM_RE, PAIR_SEP_RE, _norm, _split_value_segments doivent déjà être définis plus haut.
-
-def _get_lines_with_chars(page: fitz.Page):
-    """Retourne des lignes avec bbox + caractères (pour calcul de couverture)."""
-    d = page.get_text("rawdict")
-    out = []
-    for blk in d.get("blocks", []):
-        for li in blk.get("lines", []):
-            spans = li.get("spans", [])
-            if not spans:
-                continue
-            x0 = y0 = float("inf")
-            x1 = y1 = float("-inf")
-            chars = []
-            buf = []
-            for sp in spans:
-                for ch in sp.get("chars", []):
-                    cx0, cy0, cx1, cy1 = ch["bbox"]
-                    x0 = min(x0, cx0); y0 = min(y0, cy0)
-                    x1 = max(x1, cx1); y1 = max(y1, cy1)
-                    buf.append(ch.get("c",""))
-                    chars.append((cx0, cx1, cy0, cy1, ch.get("c","")))
-            text = _norm("".join(buf))
-            if text:
-                out.append({"x0":x0, "x1":x1, "y0":y0, "y1":y1, "y":(y0+y1)/2.0, "w":x1-x0, "text":text, "chars":chars})
-    return sorted(out, key=lambda r: (r["y"], r["x0"]))
-
 def _compute_split_x_from_char_density(lines, bins=96):
     """Projection horizontale de densité de caractères → coupe à la vallée entre deux pics."""
     if not lines:
@@ -393,11 +376,12 @@ def _compute_split_x_from_char_density(lines, bins=96):
     step = (xmax - xmin) / bins
     hist = [0.0] * bins
     for l in lines:
-        for (cx0, cx1, _, _, _) in l["chars"]:
+        for cx0, cx1 in _iter_char_xspans(l["chars"]):
             i0 = int(max(0, min(bins-1, (cx0 - xmin) // step)))
             i1 = int(max(0, min(bins-1, (cx1 - xmin) // step)))
             for i in range(i0, i1+1):
                 hist[i] += 1.0
+
     mid = bins//2
     if any(hist[:mid]) and any(hist[mid:]):
         left_peak  = max(range(0, mid), key=lambda i: hist[i])
@@ -413,7 +397,7 @@ def _compute_split_x_from_char_density(lines, bins=96):
 def _char_coverage_ratio(line, split_x: float):
     """(ratio_gauche, ratio_droite) en sommant la largeur des caractères de part et d’autre."""
     left = right = 0.0
-    for (cx0, cx1, _, _, _) in line["chars"]:
+    for cx0, cx1 in _iter_char_xspans(line["chars"]):
         w = max(0.0, cx1 - cx0)
         if ((cx0 + cx1) / 2.0) <= split_x:
             left += w
