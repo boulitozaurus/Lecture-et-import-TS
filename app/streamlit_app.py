@@ -50,15 +50,13 @@ def _build_lines_from_words(words, line_tol=3.0):
     lines.append((y, _norm(" ".join(cur["text"])), cur["x0"], cur["x1"]))
     return lines
 
-import re, statistics
-
-import re, statistics
-
 BULLET_RE   = re.compile(r"^[•●▪·\-–]+[\s]*")
+ENUM_RE     = re.compile(r"^(?:\d+[\.\)]|[a-z]\))\s+")
 PAIR_SEP_RE = re.compile(r"^(.{2,120}?)\s*[:\-–]\s*(.+)$")
+NOTE_RE     = re.compile(r"^note\s+\d+", re.I)
 
 def _extract_words_safe(page):
-    """Compat pdfplumber (kwargs varient selon versions)."""
+    """Compat pdfplumber (signatures qui varient selon versions)."""
     try:
         return page.extract_words(x_tolerance=1.5, y_tolerance=1.5, keep_blank_chars=False) or []
     except TypeError:
@@ -68,7 +66,7 @@ def _extract_words_safe(page):
             return page.extract_words() or []
 
 def _group_lines(words):
-    """Mots -> lignes (y proches). Retourne liste de dicts {'y','x0','x1','text'}."""
+    """Mots -> lignes ordonnées, avec features x0/x1/width/y/text."""
     if not words:
         return []
     words = sorted(words, key=lambda w: (w["top"], w["x0"]))
@@ -87,21 +85,21 @@ def _group_lines(words):
             y  = (cur["top"] + cur["bottom"]) / 2.0
             tx = re.sub(r"\s+", " ", " ".join(cur["buf"]).strip())
             if tx:
-                lines.append({"y": y, "x0": cur["x0"], "x1": cur["x1"], "text": tx})
+                lines.append({"y": y, "x0": cur["x0"], "x1": cur["x1"], "w": cur["x1"]-cur["x0"], "text": tx})
             cur = {"top": w["top"], "bottom": w["bottom"], "x0": w["x0"], "x1": w["x1"], "buf":[w["text"]]}
     y  = (cur["top"] + cur["bottom"]) / 2.0
     tx = re.sub(r"\s+", " ", " ".join(cur["buf"]).strip())
     if tx:
-        lines.append({"y": y, "x0": cur["x0"], "x1": cur["x1"], "text": tx})
+        lines.append({"y": y, "x0": cur["x0"], "x1": cur["x1"], "w": cur["x1"]-cur["x0"], "text": tx})
 
     return sorted(lines, key=lambda d: d["y"])
 
 def _kmeans_1d(xs, n_iter=30):
-    """K-means 1D k=2 maison (stable, pas de dépendance)."""
+    """Petit k-means 1D (k=2) pour séparer deux colonnes sans dépendances externes."""
     xs = [float(x) for x in xs]
     xs_sorted = sorted(xs)
     if not xs_sorted:
-        return (0.0, 0.0), [0]*0
+        return (0.0, 0.0), []
     c0 = xs_sorted[len(xs_sorted)//4]
     c1 = xs_sorted[3*len(xs_sorted)//4]
     c0, c1 = float(min(c0, c1)), float(max(c0, c1))
@@ -115,11 +113,11 @@ def _kmeans_1d(xs, n_iter=30):
             c0, c1 = nc0, nc1
             break
         c0, c1 = nc0, nc1
-    labels = [0 if abs(x - c0) <= abs(x - c1) else 1 for x in xs]
-    if c0 > c1:                 # s'assurer que 0 = gauche
+    labs = [0 if abs(x - c0) <= abs(x - c1) else 1 for x in xs]
+    if c0 > c1:           # garantir 0 = gauche
         c0, c1 = c1, c0
-        labels = [1-l for l in labels]
-    return (c0, c1), labels
+        labs = [1-l for l in labs]
+    return (c0, c1), labs
 
 def _split_value_segments(lines_texts):
     """
@@ -134,7 +132,6 @@ def _split_value_segments(lines_texts):
             if s:
                 segs.append(s)
         buf.clear()
-
     for t in lines_texts:
         if BULLET_RE.match(t) or PAIR_SEP_RE.match(t):
             flush()
@@ -147,7 +144,7 @@ def _split_value_segments(lines_texts):
     return segs if segs else [""]
 
 def _extract_text_pairs(page):
-    """Fallback ultra-simple: 'label : valeur' sur texte brut."""
+    """Fallback très simple: lignes 'label : valeur' sur texte brut."""
     out = []
     text = page.extract_text() or ""
     for raw in text.splitlines():
@@ -157,13 +154,13 @@ def _extract_text_pairs(page):
             out.append({"page": str(page.page_number), "label": m.group(1).strip(), "value": m.group(2).strip()})
     return out
 
-def _pair_two_columns(page, y_pad=2.0):
+def _pair_two_columns(page, y_pad=3.0):
     """
     1) mots -> lignes
-    2) k-means 1D sur x0 des LIGNES -> 2 clusters (gauche/droite)
-    3) re-classe en droite toute ligne qui commence par une puce
-    4) associe chaque label gauche aux lignes droites jusqu’au label suivant
-    5) découpe la valeur en segments (puces, X:Y, “et” pour Modalités)
+    2) k-means sur centre X des LIGNES -> 2 clusters (gauche/droite)
+    3) règles de reclassement (puces, numérotation, Note N, largeur atypique)
+    4) associe chaque label gauche aux lignes droites jusqu’au prochain label
+    5) découpe la valeur en segments (puces, X:Y, et “Modalités … et …”)
     """
     words = _extract_words_safe(page)
     if not words:
@@ -173,39 +170,66 @@ def _pair_two_columns(page, y_pad=2.0):
     if not lines:
         return _extract_text_pairs(page)
 
-    xs = [ln["x0"] for ln in lines]
-    (_, _), lab = _kmeans_1d(xs)
-    left_lines  = [ln for ln, L in zip(lines, lab) if L == 0]
-    right_lines = [ln for ln, L in zip(lines, lab) if L == 1]
+    # k-means sur le centre X des lignes
+    xmid = [ (ln["x0"] + ln["x1"]) / 2.0 for ln in lines ]
+    (cL, cR), labs = _kmeans_1d(xmid)
 
-    # Re-classer en "droite" toute ligne qui commence par une puce
-    moved = []
-    keep_left = []
-    for ln in left_lines:
-        if BULLET_RE.match(ln["text"]):
-            moved.append(ln)
+    # stats de largeur par groupe (utile pour reclasser les grosses lignes faussement à gauche)
+    left0  = [ln for ln, L in zip(lines, labs) if L == 0]
+    right0 = [ln for ln, L in zip(lines, labs) if L == 1]
+    med_lw = statistics.median([ln["w"] for ln in left0])  if left0  else 30.0
+    med_rw = statistics.median([ln["w"] for ln in right0]) if right0 else 80.0
+    split  = (cL + cR) / 2.0
+    margin = max(4.0, (med_lw + med_rw) / 10.0)
+
+    left, right = [], []
+    for ln in lines:
+        xm = (ln["x0"] + ln["x1"]) / 2.0
+        width = ln["w"]
+        txt = ln["text"]
+
+        force_right = False
+        if BULLET_RE.match(txt) or ENUM_RE.match(txt) or NOTE_RE.match(txt):
+            force_right = True
+        if width > max(med_rw*0.7, med_lw*1.3):   # vraiment trop large pour un label
+            force_right = True
+        if xm > split + margin:                    # nettement à droite
+            force_right = True
+
+        if force_right:
+            right.append(ln)
         else:
-            keep_left.append(ln)
-    left_lines  = keep_left
-    right_lines = sorted(right_lines + moved, key=lambda d: d["y"])
+            if xm < split - margin:
+                left.append(ln)
+            else:
+                # zone ambiguë → privilégie droite si assez large
+                (right if width >= med_lw else left).append(ln)
 
-    left_lines.sort(key=lambda d: d["y"])
+    left.sort(key=lambda d: d["y"])
+    right.sort(key=lambda d: d["y"])
 
     tuples = []
     r_idx = 0
-    for i, lab_ln in enumerate(left_lines):
+    for i, lab_ln in enumerate(left):
         y0 = lab_ln["y"]
-        y1 = left_lines[i+1]["y"] if i+1 < len(left_lines) else float("inf")
+        y1 = left[i+1]["y"] if i+1 < len(left) else float("inf")
 
-        # avancer le pointeur droite jusqu’à la fenêtre du label
-        while r_idx < len(right_lines) and right_lines[r_idx]["y"] < y0 - y_pad:
+        # sauter ce qui est au-dessus de la fenêtre
+        while r_idx < len(right) and right[r_idx]["y"] < y0 - y_pad:
             r_idx += 1
 
         bucket = []
         j = r_idx
-        while j < len(right_lines) and right_lines[j]["y"] < y1 - y_pad:
-            bucket.append(right_lines[j]["text"])
+        while j < len(right) and right[j]["y"] < y1 - y_pad:
+            bucket.append(right[j]["text"])
             j += 1
+
+        # récupération “zone ambiguë” si aucun bucket (ex. très rapproché du split)
+        if not bucket:
+            amb = [ln["text"] for ln in lines
+                   if (y0 - y_pad) <= ln["y"] < (y1 - y_pad)
+                   and (split - margin) <= (ln["x0"] + ln["x1"]) / 2.0 <= (split + margin)]
+            bucket.extend(amb)
 
         if not bucket:
             continue
