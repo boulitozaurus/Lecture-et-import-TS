@@ -124,6 +124,161 @@ def _split_value_segments(lines_texts):
     flush()
     return segs if segs else [""]
 
+# ==== Fallback "char-coverage" (MANQUANT) ====
+# Classe chaque ligne par couverture de caractères à gauche vs droite d'une césure.
+# Utilisé quand _two_column_pairs_from_grid ne trouve pas de césure de tableau.
+
+NOTE_RE     = re.compile(r"^note\s+\d+\b", re.I)  # si absent, réutiliser NOTE_RE déjà défini
+# BULLET_RE, ENUM_RE, PAIR_SEP_RE, _norm, _split_value_segments doivent déjà être définis plus haut.
+
+def _get_lines_with_chars(page: fitz.Page):
+    """Retourne des lignes avec bbox + caractères (pour calcul de couverture)."""
+    d = page.get_text("rawdict")
+    out = []
+    for blk in d.get("blocks", []):
+        for li in blk.get("lines", []):
+            spans = li.get("spans", [])
+            if not spans:
+                continue
+            x0 = y0 = float("inf")
+            x1 = y1 = float("-inf")
+            chars = []
+            buf = []
+            for sp in spans:
+                for ch in sp.get("chars", []):
+                    cx0, cy0, cx1, cy1 = ch["bbox"]
+                    x0 = min(x0, cx0); y0 = min(y0, cy0)
+                    x1 = max(x1, cx1); y1 = max(y1, cy1)
+                    buf.append(ch.get("c",""))
+                    chars.append((cx0, cx1, cy0, cy1, ch.get("c","")))
+            text = _norm("".join(buf))
+            if text:
+                out.append({"x0":x0, "x1":x1, "y0":y0, "y1":y1, "y":(y0+y1)/2.0, "w":x1-x0, "text":text, "chars":chars})
+    return sorted(out, key=lambda r: (r["y"], r["x0"]))
+
+def _compute_split_x_from_char_density(lines, bins=96):
+    """Projection horizontale de densité de caractères → coupe à la vallée entre deux pics."""
+    if not lines:
+        return None
+    xmin = min(l["x0"] for l in lines); xmax = max(l["x1"] for l in lines)
+    if xmax <= xmin:
+        return None
+    step = (xmax - xmin) / bins
+    hist = [0.0] * bins
+    for l in lines:
+        for (cx0, cx1, _, _, _) in l["chars"]:
+            i0 = int(max(0, min(bins-1, (cx0 - xmin) // step)))
+            i1 = int(max(0, min(bins-1, (cx1 - xmin) // step)))
+            for i in range(i0, i1+1):
+                hist[i] += 1.0
+    mid = bins//2
+    if any(hist[:mid]) and any(hist[mid:]):
+        left_peak  = max(range(0, mid), key=lambda i: hist[i])
+        right_peak = max(range(mid, bins), key=lambda i: hist[i])
+        if right_peak - left_peak >= 4:
+            valley = min(range(left_peak+1, right_peak), key=lambda i: hist[i])
+            return float(xmin + valley * step)
+    # fallback: médiane des centres
+    centers = [ (l["x0"]+l["x1"])/2.0 for l in lines ]
+    import statistics
+    return float(statistics.median(centers))
+
+def _char_coverage_ratio(line, split_x: float):
+    """(ratio_gauche, ratio_droite) en sommant la largeur des caractères de part et d’autre."""
+    left = right = 0.0
+    for (cx0, cx1, _, _, _) in line["chars"]:
+        w = max(0.0, cx1 - cx0)
+        if ((cx0 + cx1) / 2.0) <= split_x:
+            left += w
+        else:
+            right += w
+    tot = left + right
+    if tot <= 0:
+        return 0.5, 0.5
+    return left/tot, right/tot
+
+def _merge_left_labels_if_no_right_between(left, right, y_pad=2.0):
+    """Fusionne les labels multilignes s'il n'y a aucune valeur entre deux lignes gauche."""
+    merged = []
+    i = 0
+    while i < len(left):
+        y0 = left[i]["y"]; txt = left[i]["text"]
+        j = i + 1
+        while j < len(left):
+            y1 = left[j]["y"]
+            if any((y0 - y_pad) <= r["y"] < (y1 - y_pad) for r in right):
+                break
+            txt += " " + left[j]["text"]
+            j += 1
+        merged.append({"y": y0, "text": _norm(txt)})
+        i = j
+    return merged
+
+def _two_column_pairs_char_coverage(page: fitz.Page, y_pad=3.0, left_threshold=0.6):
+    """
+    Fallback robuste quand pas de grille trouvée.
+    Classe chaque ligne par couverture de caractères à gauche/droite de split_x.
+    - >60% à gauche → label ; sinon → valeur
+    - puces/énum/notes forcées en valeur
+    - labels multilignes fusionnés s'il n'y a aucune valeur entre-deux
+    """
+    lines = _get_lines_with_chars(page)
+    if not lines:
+        return []
+
+    split_x = _compute_split_x_from_char_density(lines)
+    if split_x is None:
+        # fallback minimal "label: valeur" sur le texte brut
+        txt = page.get_text("text") or ""
+        out = []
+        for raw in txt.splitlines():
+            m = PAIR_SEP_RE.match(_norm(raw))
+            if m:
+                out.append({"page": str(page.number + 1), "label": m.group(1).strip(), "value": m.group(2).strip()})
+        return out
+
+    left_lines, right_lines = [], []
+    for ln in lines:
+        lg, rg = _char_coverage_ratio(ln, split_x)
+        txt = ln["text"]
+        # forcer "valeur" si évident
+        if BULLET_RE.match(txt) or ENUM_RE.match(txt) or NOTE_RE.match(txt):
+            right_lines.append({"y": ln["y"], "text": txt})
+        else:
+            (left_lines if lg >= left_threshold else right_lines).append({"y": ln["y"], "text": txt})
+
+    left_lines  = sorted(left_lines, key=lambda d: d["y"])
+    right_lines = sorted(right_lines, key=lambda d: d["y"])
+
+    # fusion labels multilignes
+    left_lines = _merge_left_labels_if_no_right_between(left_lines, right_lines, y_pad=y_pad)
+
+    # association label -> valeurs
+    tuples = []
+    ridx = 0
+    for i, lab in enumerate(left_lines):
+        y0 = lab["y"]
+        y1 = left_lines[i+1]["y"] if i+1 < len(left_lines) else float("inf")
+        while ridx < len(right_lines) and right_lines[ridx]["y"] < y0 - y_pad:
+            ridx += 1
+        bucket, j = [], ridx
+        while j < len(right_lines) and right_lines[j]["y"] < y1 - y_pad:
+            bucket.append(right_lines[j]["text"])
+            j += 1
+        if not bucket:
+            continue
+        segments = _split_value_segments(bucket)
+
+        is_modalites = bool(re.search(r"(?i)modalit[éè]s?.*remboursement", lab["text"]))
+        for seg in segments:
+            if is_modalites and " et " in seg:
+                for part in [p.strip() for p in seg.split(" et ") if p.strip()]:
+                    tuples.append({"page": str(page.number + 1), "label": lab["text"], "value": part})
+            else:
+                tuples.append({"page": str(page.number + 1), "label": lab["text"], "value": seg})
+    return tuples
+# ==== fin fallback ====
+
 def _two_column_pairs_from_grid(page: fitz.Page, y_pad=2.0):
     """
     1) Cherche colonnes & rangées via traits vectoriels.
