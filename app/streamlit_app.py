@@ -50,11 +50,13 @@ def _build_lines_from_words(words, line_tol=3.0):
     lines.append((y, _norm(" ".join(cur["text"])), cur["x0"], cur["x1"]))
     return lines
 
+import re, statistics
+
 BULLET_RE = re.compile(r"^[•●▪·\-–]+[\s]*")
 PAIR_SEP_RE = re.compile(r"^(.{2,80}?)\s*[:\-–]\s*(.+)$")
 
 def _extract_words_safe(page):
-    """Extraction de mots compatible avec plusieurs versions de pdfplumber."""
+    """Compat pdfplumber: essaie avec paramètres, puis fallback."""
     try:
         return page.extract_words(x_tolerance=1.5, y_tolerance=1.5, keep_blank_chars=False) or []
     except TypeError:
@@ -63,32 +65,38 @@ def _extract_words_safe(page):
         except Exception:
             return page.extract_words() or []
 
-def _find_split_x(words):
-    """Trouve la césure gauche/droite via histogramme des centres X (fallback médiane)."""
-    centers = [ (w["x0"] + w["x1"]) / 2.0 for w in words ]
-    if not centers:
-        return None
-    if np is not None:
-        try:
-            hist, edges = np.histogram(centers, bins=40)
-            if hist.sum() > 0:
-                n = len(hist)
-                lh = int(np.argmax(hist[:n//2])) if n >= 2 else 0
-                rh = int(np.argmax(hist[n//2:])) + n//2 if n >= 2 else 0
-                if 0 <= lh < rh-1:
-                    valley_idx = lh + 1 + int(np.argmin(hist[lh+1:rh]))
-                    return float((edges[valley_idx] + edges[valley_idx+1]) / 2.0)
-        except Exception:
-            pass
-    return float(statistics.median(centers))
+def _kmeans_1d(xs, n_iter=30):
+    """Petit k-means 1D (k=2) pour séparer gauche/droite sans dépendance externe."""
+    xs = [float(x) for x in xs]
+    xs_sorted = sorted(xs)
+    c0 = xs_sorted[len(xs_sorted)//4]
+    c1 = xs_sorted[3*len(xs_sorted)//4]
+    c0, c1 = float(min(c0, c1)), float(max(c0, c1))
+    for _ in range(n_iter):
+        g0 = [x for x in xs if abs(x - c0) <= abs(x - c1)]
+        g1 = [x for x in xs if abs(x - c0) >  abs(x - c1)]
+        if not g0 or not g1:
+            break
+        new_c0 = sum(g0) / len(g0)
+        new_c1 = sum(g1) / len(g1)
+        if abs(new_c0 - c0) < 0.1 and abs(new_c1 - c1) < 0.1:
+            c0, c1 = new_c0, new_c1
+            break
+        c0, c1 = new_c0, new_c1
+    labels = [0 if abs(x - c0) <= abs(x - c1) else 1 for x in xs]
+    if c0 > c1:  # s'assurer que 0 = gauche
+        c0, c1 = c1, c0
+        labels = [1 - l for l in labels]
+    return (c0, c1), labels
 
-def _group_lines(words):
-    """Regroupe chars en lignes (basé sur Y) et renvoie des dicts {'y','x0','text'} triés."""
+def _build_lines_from_words(words, line_tol=None):
+    """Regroupe mots -> lignes (pour UN cluster)."""
     if not words:
         return []
     words = sorted(words, key=lambda w: (w["top"], w["x0"]))
     heights = [ (w["bottom"] - w["top"]) for w in words if "bottom" in w and "top" in w ]
-    line_tol = max(2.0, statistics.median(heights)/2.0) if heights else 3.0
+    if line_tol is None:
+        line_tol = max(2.0, (sorted(heights)[len(heights)//2] if heights else 6.0) / 2.0)
     lines = []
     cur = {"top": words[0]["top"], "bottom": words[0]["bottom"], "x0": words[0]["x0"], "x1": words[0]["x1"], "buf":[words[0]["text"]]}
     for w in words[1:]:
@@ -99,86 +107,87 @@ def _group_lines(words):
             cur["bottom"] = max(cur["bottom"], w["bottom"])
         else:
             y = (cur["top"] + cur["bottom"]) / 2.0
-            lines.append({"y": y, "x0": cur["x0"], "text": re.sub(r"\s+", " ", " ".join(cur["buf"]).strip())})
+            lines.append((y, re.sub(r"\s+", " ", " ".join(cur["buf"]).strip()), cur["x0"], cur["x1"]))
             cur = {"top": w["top"], "bottom": w["bottom"], "x0": w["x0"], "x1": w["x1"], "buf":[w["text"]]}
     y = (cur["top"] + cur["bottom"]) / 2.0
-    lines.append({"y": y, "x0": cur["x0"], "text": re.sub(r"\s+", " ", " ".join(cur["buf"]).strip())})
-    return [ln for ln in lines if ln["text"]]
+    lines.append((y, re.sub(r"\s+", " ", " ".join(cur["buf"]).strip()), cur["x0"], cur["x1"]))
+    return lines
 
-def _split_value_segments(lines):
+def _split_value_segments(lines_texts):
     """
-    Découpe une séquence de lignes droite en segments de valeur :
-    - nouvelle valeur si la ligne commence par une puce
-    - ou si 'X : Y' (sous-paire)
-    Sinon, on concatène (wrapping).
+    Découpe la valeur en segments :
+    - nouvelle entrée si puce (•, -, …) ou si 'X : Y'
+    - sinon, concatène (wrapping).
     """
-    segs = []
-    buf = []
+    segs, buf = [], []
     def flush():
         if buf:
-            val = re.sub(r"\s+", " ", " ".join(buf).strip())
-            if val:
-                segs.append(val)
+            s = re.sub(r"\s+", " ", " ".join(buf).strip())
+            if s:
+                segs.append(s)
         buf.clear()
-    for ln in lines:
-        t = ln["text"]
-        if BULLET_RE.match(t) or PAIR_SEP_RE.match(t):
+    for txt in lines_texts:
+        if BULLET_RE.match(txt) or PAIR_SEP_RE.match(txt):
             flush()
-            t = BULLET_RE.sub("", t, count=1).strip()
-            if t:
-                segs.append(t)
+            txt = BULLET_RE.sub("", txt, count=1).strip()
+            if txt:
+                segs.append(txt)
         else:
-            buf.append(t)
+            buf.append(txt)
     flush()
-    return segs if segs else [""]  # au moins un segment vide si rien
+    return segs if segs else [""]
 
-def _pair_two_columns(page, margin=8.0):
+def _pair_two_columns(page, y_pad=2.0):
     """
-    Coupage 2 colonnes :
-    - labels = lignes dont x0 <= split_x - margin
-    - valeurs = lignes dont x0 >= split_x + margin
-    Chaque label collecte toutes les valeurs jusqu'au prochain label (fenêtre [y_label, y_next_label)).
+    Sépare d’abord les mots en 2 clusters X (gauche/droite) par k-means 1D,
+    reconstruit les lignes dans CHAQUE cluster, puis associe
+    chaque label gauche aux lignes droites suivantes jusqu’au prochain label.
     """
     words = _extract_words_safe(page)
     if not words:
-        # Fallback lecture "label: valeur" depuis texte simple
         return _extract_text_pairs(page)
 
-    split_x = _find_split_x(words)
-    if split_x is None:
-        return _extract_text_pairs(page)
+    centers = [ (w["x0"] + w["x1"]) / 2.0 for w in words ]
+    (_, _), labels = _kmeans_1d(centers)
 
-    lines = sorted(_group_lines(words), key=lambda d: d["y"])
-    left  = [ln for ln in lines if ln["x0"] <= split_x - margin]
-    right = [ln for ln in lines if ln["x0"] >= split_x + margin]
-    if not left and not right:
-        return _extract_text_pairs(page)
+    left_words  = [w for w, l in zip(words, labels) if l == 0]
+    right_words = [w for w, l in zip(words, labels) if l == 1]
+
+    left_lines  = _build_lines_from_words(left_words)
+    right_lines = _build_lines_from_words(right_words)
+
+    left_lines.sort(key=lambda t: t[0])   # by y
+    right_lines.sort(key=lambda t: t[0])  # by y
 
     tuples = []
+    r_idx = 0
+    for i, (y_label, label_txt, _, _) in enumerate(left_lines):
+        next_y = left_lines[i+1][0] if i+1 < len(left_lines) else float("inf")
 
-    # Indexation des lignes droite par Y (pour fenêtre facile)
-    right_by_y = right
+        # avancer l’index right jusqu’à la fenêtre du label
+        while r_idx < len(right_lines) and right_lines[r_idx][0] < y_label - y_pad:
+            r_idx += 1
 
-    for i, lab in enumerate(left):
-        y0 = lab["y"]
-        y1 = left[i+1]["y"] if i+1 < len(left) else float("inf")
+        # collecter toutes les lignes droites jusqu’au prochain label
+        bucket = []
+        j = r_idx
+        while j < len(right_lines) and right_lines[j][0] < next_y - y_pad:
+            bucket.append(right_lines[j][1])
+            j += 1
 
-        # toutes les lignes droite entre y0-δ et y1-ε
-        bucket = [ln for ln in right_by_y if y0 - 1.5 <= ln["y"] < y1 - 0.1]
         if not bucket:
             continue
 
-        # Scinder en segments (puces, sous-paires)
         segments = _split_value_segments(bucket)
 
-        # Cas spécial 'Modalités de remboursement' : séparer "… et …"
-        is_modalites = bool(re.search(r"(?i)modalit[éè]s?.*remboursement", lab["text"]))
+        # Cas spécial: Modalités de remboursement → séparer “ … et … ”
+        is_modalites = bool(re.search(r"(?i)modalit[éè]s?.*remboursement", label_txt))
         for seg in segments:
             if is_modalites and " et " in seg:
                 for part in [p.strip() for p in seg.split(" et ") if p.strip()]:
-                    tuples.append({"page": str(page.page_number), "label": lab["text"], "value": part})
+                    tuples.append({"page": str(page.page_number), "label": label_txt, "value": part})
             else:
-                tuples.append({"page": str(page.page_number), "label": lab["text"], "value": seg})
+                tuples.append({"page": str(page.page_number), "label": label_txt, "value": seg})
 
     return tuples
 
