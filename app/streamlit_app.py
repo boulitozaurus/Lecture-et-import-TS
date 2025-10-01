@@ -37,7 +37,7 @@ def _extract_tables(page: pdfplumber.page.Page):
             continue
         out.append({
             "page": str(page.page_number),
-            "source": "table",
+            "source": "tables",
             "label": left,
             "value": right,
             "row": str(r_idx),
@@ -86,16 +86,33 @@ def _summary_by_page(tuples):
         return pd.DataFrame(columns=["page","tables","text","total"])
     rows = {}
     for t in tuples:
-        p = t["page"]
-        src = t["source"]
-        rows.setdefault(p, {"tables":0, "text":0})
-        rows[p][src] += 1
+        p = str(t.get("page", "?"))
+        src = (t.get("source", "") or "").lower()
+
+        # normalise la source -> "tables" | "text" (gère "table", "tables", autres)
+        if src.startswith("table"):
+            src_norm = "tables"
+        elif src == "text":
+            src_norm = "text"
+        else:
+            # toute autre source inattendue compte dans "text" par défaut
+            src_norm = "text"
+
+        if p not in rows:
+            rows[p] = {"tables": 0, "text": 0}
+        rows[p][src_norm] += 1
+
     data = []
-    for p, d in sorted(rows.items(), key=lambda kv: int(kv[0])):
-        total = d["tables"] + d["text"]
-        data.append({"page": str(p), "tables": str(d["tables"]), "text": str(d["text"]), "total": str(total)})
-    df = pd.DataFrame(data, columns=["page","tables","text","total"]).astype("string")
-    return df
+    for p in sorted(rows.keys(), key=lambda x: int(x) if str(x).isdigit() else 0):
+        t_tables = rows[p]["tables"]
+        t_text = rows[p]["text"]
+        data.append({
+            "page": str(p),
+            "tables": str(t_tables),
+            "text": str(t_text),
+            "total": str(t_tables + t_text),
+        })
+    return pd.DataFrame(data, columns=["page","tables","text","total"]).astype("string")
 
 # -------------------------------------------------------------------
 # UI minimale : upload → tuples (aucune règle, aucun mapping)
