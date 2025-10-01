@@ -47,19 +47,48 @@ def _build_lines_from_words(words, line_tol=3.0):
 
 def _pair_two_columns(page, y_tol=5.0):
     """
-    Reconstruit la table 2 colonnes par clustering gauche/droite sur la position x des mots.
-    Renvoie une liste de tuples bruts: {"page","label","value"} (un tuple par ligne de valeur).
-    - Si une valeur contient une puce → nouveau tuple.
-    - Si une nouvelle ligne contient ":" tôt → nouveau tuple (ex: 'SIRET : ...').
-    - Sinon, on concatène les lignes de valeur d'un même label (wrapping).
+    Reconstruit la table 2 colonnes en se basant sur la position X des mots.
+    Robuste aux versions de pdfplumber : si extract_words(...) lève TypeError,
+    on réessaie sans paramètres ; si pas de mots -> fallback texte (label: valeur).
     """
-    words = page.extract_words(x_tolerance=1.5, y_tolerance=1.5, keep_spaces=False) or []
-    if not words:
-        return []
+    # 1) Récupération des mots (robuste aux versions)
+    try:
+        words = page.extract_words(x_tolerance=1.5, y_tolerance=1.5, keep_blank_chars=False) or []
+    except TypeError:
+        # Anciennes versions : certains kwargs ne sont pas supportés
+        try:
+            words = page.extract_words(x_tolerance=1.5, y_tolerance=1.5) or []
+        except Exception:
+            words = page.extract_words() or []
 
-    # seuil médian des centres x pour couper en colonne gauche / droite
+    # 2) Si aucun mot (PDF scanné, ou extraction impossible) -> fallback texte simple
+    if not words:
+        return _extract_text_pairs(page)
+
+    # ---------- reconstruction 2 colonnes ----------
+    import statistics
     centers = [ (w["x0"] + w["x1"]) / 2.0 for w in words ]
     mid_x = statistics.median(centers)
+
+    def _build_lines_from_words(words, line_tol=3.0):
+        words = sorted(words, key=lambda w: (w["top"], w["x0"]))
+        if not words:
+            return []
+        lines = []
+        cur = {"top": words[0]["top"], "bottom": words[0]["bottom"], "text": [], "x0": words[0]["x0"], "x1": words[0]["x1"]}
+        for w in words:
+            if abs(w["top"] - cur["top"]) <= line_tol:
+                cur["text"].append(w["text"])
+                cur["x0"] = min(cur["x0"], w["x0"])
+                cur["x1"] = max(cur["x1"], w["x1"])
+                cur["bottom"] = max(cur["bottom"], w["bottom"])
+            else:
+                y = (cur["top"] + cur["bottom"]) / 2.0
+                lines.append((y, _norm(" ".join(cur["text"])), cur["x0"], cur["x1"]))
+                cur = {"top": w["top"], "bottom": w["bottom"], "text": [w["text"]], "x0": w["x0"], "x1": w["x1"]}
+        y = (cur["top"] + cur["bottom"]) / 2.0
+        lines.append((y, _norm(" ".join(cur["text"])), cur["x0"], cur["x1"]))
+        return lines
 
     left_words  = [w for w in words if (w["x0"] + w["x1"]) / 2.0 <= mid_x]
     right_words = [w for w in words if (w["x0"] + w["x1"]) / 2.0 >  mid_x]
@@ -67,7 +96,7 @@ def _pair_two_columns(page, y_tol=5.0):
     left_lines  = _build_lines_from_words(left_words)
     right_lines = _build_lines_from_words(right_words)
 
-    # Fusion des lignes par y croissant
+    # fusion des lignes par Y croissant
     events = []
     for y, txt, x0, x1 in left_lines:
         if txt:
@@ -77,9 +106,12 @@ def _pair_two_columns(page, y_tol=5.0):
             events.append((y, "R", txt))
     events.sort(key=lambda e: e[0])
 
+    BULLET_RE = re.compile(r"^[•●▪\-–]")
+    PAIR_SEP_RE = re.compile(r"(.{3,120}?)\s*[:\-–]\s*(.+)$")
+
     tuples = []
     cur_label = None
-    buffer_lines = []  # on concatène les lignes non-puce tant qu'on reste sur le même label
+    buffer_lines = []
 
     def flush_buffer():
         nonlocal buffer_lines, cur_label, tuples
@@ -91,37 +123,31 @@ def _pair_two_columns(page, y_tol=5.0):
 
     last_y = None
     for y, kind, txt in events:
-        # si deux events à ~même y, on force L avant R
         if last_y is not None and abs(y - last_y) <= y_tol:
             pass
         last_y = y
 
         if kind == "L":
-            # nouveau label -> on flush la valeur précédente
             flush_buffer()
             cur_label = txt
         else:  # "R"
             if not cur_label:
-                # aucune étiquette détectée avant -> on tente un fallback "label: valeur"
                 m = PAIR_SEP_RE.match(txt)
                 if m:
                     tuples.append({"page": str(page.page_number), "label": _norm(m.group(1)), "value": _norm(m.group(2))})
                 continue
 
-            if BULLET_RE.match(txt) or (":" in txt[:25]):   # nouvelle sous-valeur (puce ou 'X : ...')
+            if BULLET_RE.match(txt) or (":" in txt[:25]):
                 flush_buffer()
-                # enlève la puce si présente
                 val = _norm(re.sub(BULLET_RE, "", txt, count=1))
                 if val:
                     tuples.append({"page": str(page.page_number), "label": cur_label, "value": val})
             else:
-                # wrapping simple -> on concatène
                 buffer_lines.append(txt)
 
-    # fin de page -> flush le dernier bloc
     flush_buffer()
 
-    # Règle spéciale pour "Modalités de remboursement": si une valeur contient " et ", on sépare en 2 tuples
+    # Règle utile : séparer les 'Modalités de remboursement' en deux tuples si '... et ...'
     out = []
     for t in tuples:
         if re.search(r"(?i)modalit[éè]s?.*remboursement", t["label"]) and " et " in t["value"]:
