@@ -3,8 +3,13 @@ from pathlib import Path
 import streamlit as st
 import pandas as pd
 import pdfplumber
-import re
-import statistics
+import re, statistics
+# 👉 ajoute (en haut du fichier, avec les autres imports) :
+try:
+    import numpy as np
+except Exception:
+    np = None
+
 
 HERE = Path(__file__).resolve()
 ROOT = HERE.parents[1]
@@ -45,117 +50,147 @@ def _build_lines_from_words(words, line_tol=3.0):
     lines.append((y, _norm(" ".join(cur["text"])), cur["x0"], cur["x1"]))
     return lines
 
-def _pair_two_columns(page, y_tol=5.0):
-    """
-    Reconstruit la table 2 colonnes en se basant sur la position X des mots.
-    Robuste aux versions de pdfplumber : si extract_words(...) lève TypeError,
-    on réessaie sans paramètres ; si pas de mots -> fallback texte (label: valeur).
-    """
-    # 1) Récupération des mots (robuste aux versions)
-    try:
-        words = page.extract_words(x_tolerance=1.5, y_tolerance=1.5, keep_blank_chars=False) or []
-    except TypeError:
-        # Anciennes versions : certains kwargs ne sont pas supportés
-        try:
-            words = page.extract_words(x_tolerance=1.5, y_tolerance=1.5) or []
-        except Exception:
-            words = page.extract_words() or []
+BULLET_RE = re.compile(r"^[•●▪·\-–]+[\s]*")
+PAIR_SEP_RE = re.compile(r"^(.{2,80}?)\s*[:\-–]\s*(.+)$")
 
-    # 2) Si aucun mot (PDF scanné, ou extraction impossible) -> fallback texte simple
+def _extract_words_safe(page):
+    """Extraction de mots compatible avec plusieurs versions de pdfplumber."""
+    try:
+        return page.extract_words(x_tolerance=1.5, y_tolerance=1.5, keep_blank_chars=False) or []
+    except TypeError:
+        try:
+            return page.extract_words(x_tolerance=1.5, y_tolerance=1.5) or []
+        except Exception:
+            return page.extract_words() or []
+
+def _find_split_x(words):
+    """Trouve la césure gauche/droite via histogramme des centres X (fallback médiane)."""
+    centers = [ (w["x0"] + w["x1"]) / 2.0 for w in words ]
+    if not centers:
+        return None
+    if np is not None:
+        try:
+            hist, edges = np.histogram(centers, bins=40)
+            if hist.sum() > 0:
+                n = len(hist)
+                lh = int(np.argmax(hist[:n//2])) if n >= 2 else 0
+                rh = int(np.argmax(hist[n//2:])) + n//2 if n >= 2 else 0
+                if 0 <= lh < rh-1:
+                    valley_idx = lh + 1 + int(np.argmin(hist[lh+1:rh]))
+                    return float((edges[valley_idx] + edges[valley_idx+1]) / 2.0)
+        except Exception:
+            pass
+    return float(statistics.median(centers))
+
+def _group_lines(words):
+    """Regroupe chars en lignes (basé sur Y) et renvoie des dicts {'y','x0','text'} triés."""
     if not words:
+        return []
+    words = sorted(words, key=lambda w: (w["top"], w["x0"]))
+    heights = [ (w["bottom"] - w["top"]) for w in words if "bottom" in w and "top" in w ]
+    line_tol = max(2.0, statistics.median(heights)/2.0) if heights else 3.0
+    lines = []
+    cur = {"top": words[0]["top"], "bottom": words[0]["bottom"], "x0": words[0]["x0"], "x1": words[0]["x1"], "buf":[words[0]["text"]]}
+    for w in words[1:]:
+        if abs(w["top"] - cur["top"]) <= line_tol:
+            cur["buf"].append(w["text"])
+            cur["x0"] = min(cur["x0"], w["x0"])
+            cur["x1"] = max(cur["x1"], w["x1"])
+            cur["bottom"] = max(cur["bottom"], w["bottom"])
+        else:
+            y = (cur["top"] + cur["bottom"]) / 2.0
+            lines.append({"y": y, "x0": cur["x0"], "text": re.sub(r"\s+", " ", " ".join(cur["buf"]).strip())})
+            cur = {"top": w["top"], "bottom": w["bottom"], "x0": w["x0"], "x1": w["x1"], "buf":[w["text"]]}
+    y = (cur["top"] + cur["bottom"]) / 2.0
+    lines.append({"y": y, "x0": cur["x0"], "text": re.sub(r"\s+", " ", " ".join(cur["buf"]).strip())})
+    return [ln for ln in lines if ln["text"]]
+
+def _split_value_segments(lines):
+    """
+    Découpe une séquence de lignes droite en segments de valeur :
+    - nouvelle valeur si la ligne commence par une puce
+    - ou si 'X : Y' (sous-paire)
+    Sinon, on concatène (wrapping).
+    """
+    segs = []
+    buf = []
+    def flush():
+        if buf:
+            val = re.sub(r"\s+", " ", " ".join(buf).strip())
+            if val:
+                segs.append(val)
+        buf.clear()
+    for ln in lines:
+        t = ln["text"]
+        if BULLET_RE.match(t) or PAIR_SEP_RE.match(t):
+            flush()
+            t = BULLET_RE.sub("", t, count=1).strip()
+            if t:
+                segs.append(t)
+        else:
+            buf.append(t)
+    flush()
+    return segs if segs else [""]  # au moins un segment vide si rien
+
+def _pair_two_columns(page, margin=8.0):
+    """
+    Coupage 2 colonnes :
+    - labels = lignes dont x0 <= split_x - margin
+    - valeurs = lignes dont x0 >= split_x + margin
+    Chaque label collecte toutes les valeurs jusqu'au prochain label (fenêtre [y_label, y_next_label)).
+    """
+    words = _extract_words_safe(page)
+    if not words:
+        # Fallback lecture "label: valeur" depuis texte simple
         return _extract_text_pairs(page)
 
-    # ---------- reconstruction 2 colonnes ----------
-    import statistics
-    centers = [ (w["x0"] + w["x1"]) / 2.0 for w in words ]
-    mid_x = statistics.median(centers)
+    split_x = _find_split_x(words)
+    if split_x is None:
+        return _extract_text_pairs(page)
 
-    def _build_lines_from_words(words, line_tol=3.0):
-        words = sorted(words, key=lambda w: (w["top"], w["x0"]))
-        if not words:
-            return []
-        lines = []
-        cur = {"top": words[0]["top"], "bottom": words[0]["bottom"], "text": [], "x0": words[0]["x0"], "x1": words[0]["x1"]}
-        for w in words:
-            if abs(w["top"] - cur["top"]) <= line_tol:
-                cur["text"].append(w["text"])
-                cur["x0"] = min(cur["x0"], w["x0"])
-                cur["x1"] = max(cur["x1"], w["x1"])
-                cur["bottom"] = max(cur["bottom"], w["bottom"])
-            else:
-                y = (cur["top"] + cur["bottom"]) / 2.0
-                lines.append((y, _norm(" ".join(cur["text"])), cur["x0"], cur["x1"]))
-                cur = {"top": w["top"], "bottom": w["bottom"], "text": [w["text"]], "x0": w["x0"], "x1": w["x1"]}
-        y = (cur["top"] + cur["bottom"]) / 2.0
-        lines.append((y, _norm(" ".join(cur["text"])), cur["x0"], cur["x1"]))
-        return lines
-
-    left_words  = [w for w in words if (w["x0"] + w["x1"]) / 2.0 <= mid_x]
-    right_words = [w for w in words if (w["x0"] + w["x1"]) / 2.0 >  mid_x]
-
-    left_lines  = _build_lines_from_words(left_words)
-    right_lines = _build_lines_from_words(right_words)
-
-    # fusion des lignes par Y croissant
-    events = []
-    for y, txt, x0, x1 in left_lines:
-        if txt:
-            events.append((y, "L", txt))
-    for y, txt, x0, x1 in right_lines:
-        if txt:
-            events.append((y, "R", txt))
-    events.sort(key=lambda e: e[0])
-
-    BULLET_RE = re.compile(r"^[•●▪\-–]")
-    PAIR_SEP_RE = re.compile(r"(.{3,120}?)\s*[:\-–]\s*(.+)$")
+    lines = sorted(_group_lines(words), key=lambda d: d["y"])
+    left  = [ln for ln in lines if ln["x0"] <= split_x - margin]
+    right = [ln for ln in lines if ln["x0"] >= split_x + margin]
+    if not left and not right:
+        return _extract_text_pairs(page)
 
     tuples = []
-    cur_label = None
-    buffer_lines = []
 
-    def flush_buffer():
-        nonlocal buffer_lines, cur_label, tuples
-        if cur_label and buffer_lines:
-            val = _norm(" ".join(buffer_lines))
-            if val:
-                tuples.append({"page": str(page.page_number), "label": cur_label, "value": val})
-        buffer_lines = []
+    # Indexation des lignes droite par Y (pour fenêtre facile)
+    right_by_y = right
 
-    last_y = None
-    for y, kind, txt in events:
-        if last_y is not None and abs(y - last_y) <= y_tol:
-            pass
-        last_y = y
+    for i, lab in enumerate(left):
+        y0 = lab["y"]
+        y1 = left[i+1]["y"] if i+1 < len(left) else float("inf")
 
-        if kind == "L":
-            flush_buffer()
-            cur_label = txt
-        else:  # "R"
-            if not cur_label:
-                m = PAIR_SEP_RE.match(txt)
-                if m:
-                    tuples.append({"page": str(page.page_number), "label": _norm(m.group(1)), "value": _norm(m.group(2))})
-                continue
+        # toutes les lignes droite entre y0-δ et y1-ε
+        bucket = [ln for ln in right_by_y if y0 - 1.5 <= ln["y"] < y1 - 0.1]
+        if not bucket:
+            continue
 
-            if BULLET_RE.match(txt) or (":" in txt[:25]):
-                flush_buffer()
-                val = _norm(re.sub(BULLET_RE, "", txt, count=1))
-                if val:
-                    tuples.append({"page": str(page.page_number), "label": cur_label, "value": val})
+        # Scinder en segments (puces, sous-paires)
+        segments = _split_value_segments(bucket)
+
+        # Cas spécial 'Modalités de remboursement' : séparer "… et …"
+        is_modalites = bool(re.search(r"(?i)modalit[éè]s?.*remboursement", lab["text"]))
+        for seg in segments:
+            if is_modalites and " et " in seg:
+                for part in [p.strip() for p in seg.split(" et ") if p.strip()]:
+                    tuples.append({"page": str(page.page_number), "label": lab["text"], "value": part})
             else:
-                buffer_lines.append(txt)
+                tuples.append({"page": str(page.page_number), "label": lab["text"], "value": seg})
 
-    flush_buffer()
+    return tuples
 
-    # Règle utile : séparer les 'Modalités de remboursement' en deux tuples si '... et ...'
+def _extract_text_pairs(page):
+    """Fallback : parse les lignes 'label : valeur' du texte simple."""
     out = []
-    for t in tuples:
-        if re.search(r"(?i)modalit[éè]s?.*remboursement", t["label"]) and " et " in t["value"]:
-            parts = [ _norm(p) for p in t["value"].split(" et ") if _norm(p) ]
-            for p in parts:
-                out.append({"page": t["page"], "label": t["label"], "value": p})
-        else:
-            out.append(t)
+    text = page.extract_text() or ""
+    for raw in text.splitlines():
+        line = re.sub(r"\s+", " ", raw or "").strip()
+        m = PAIR_SEP_RE.match(line)
+        if m:
+            out.append({"page": str(page.page_number), "label": m.group(1).strip(), "value": m.group(2).strip()})
     return out
 
 def _extract_footnotes(page):
